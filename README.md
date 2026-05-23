@@ -1,4 +1,5 @@
-# LieDA (Lie Detector Attacker)
+# LieDA
+Lie Detector Attacker
 
 ## Install
 
