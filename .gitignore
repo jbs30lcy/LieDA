@@ -1,0 +1,11 @@
+# Python bytecode and caches
+__pycache__/
+.venv/
+.env
+.env.*
+!.env.example
+.ipynb_checkpoints/
+build/
+dist/
+.vscode/
+desktop.ini
