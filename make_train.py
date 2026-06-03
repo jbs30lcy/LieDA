@@ -10,7 +10,18 @@ from PIL import Image, ImageFilter
 
 SCALE_PATTERN = re.compile(r"scale_(\d+)_")
 LENS_SHAPE_KINDS = ("circle", "rectangle", "triangle", "star")
+LENS_RADIUS_RATIO = 0.092
+RECTANGLE_SIZE_MULTIPLIER = float(np.sqrt(np.pi))
+STAR_INNER_RADIUS_MULTIPLIER = 0.55
+MOVING_SHAPE_ROTATION_PERIOD_FRAMES = 45
+MOVING_SHAPE_FADE_SECONDS = 2.0
+LENS_RIM_REFRACTION = 0.0
+LENS_OUTER_LINE_DARKNESS = 0.40
+LENS_DARKSIDE_STRENGTH = 0.14
+MOVING_SHAPE_MIN_CONTROL_POINT_DISTANCE = 50.0
+MOVING_SHAPE_MAX_CONTROL_POINT_DISTANCE = 300.0
 LensShape = dict[str, float | int | str]
+Point = tuple[float, float]
 
 
 def make_base_image(
@@ -124,7 +135,7 @@ def make_distorted_background(
     return Image.fromarray(frame, mode="RGB")
 
 
-def default_lens_circles(
+def get_shape_anchors(
     source_w: int,
     source_h: int,
     count: int = 8,
@@ -134,23 +145,23 @@ def default_lens_circles(
 ) -> list[tuple[float, float, float]]:
     rng = rng or random
     size = min(source_w, source_h)
-    circles: list[tuple[float, float, float]] = []
+    anchors: list[tuple[float, float, float]] = []
     attempts = 0
-    while len(circles) < count and attempts < max_attempts:
+    while len(anchors) < count and attempts < max_attempts:
         attempts += 1
-        radius = rng.uniform(0.080, 0.092) * size
+        radius = LENS_RADIUS_RATIO * size
         center_x = rng.uniform(radius, source_w - radius)
         center_y = rng.uniform(radius, source_h - radius)
         if any(
             np.hypot(center_x - x, center_y - y) < radius + other_radius + min_gap * size
-            for x, y, other_radius in circles
+            for x, y, other_radius in anchors
         ):
             continue
-        circles.append((center_x, center_y, radius))
-    return circles
+        anchors.append((center_x, center_y, radius))
+    return anchors
 
 
-def default_lens_shapes(
+def get_shapes(
     source_w: int,
     source_h: int,
     count: int = 8,
@@ -159,17 +170,17 @@ def default_lens_shapes(
     rng = rng or random
     shapes: list[LensShape] = []
     kind = rng.choice(LENS_SHAPE_KINDS)
-    for x, y, radius in default_lens_circles(source_w, source_h, count=count, rng=rng):
+    for x, y, radius in get_shape_anchors(source_w, source_h, count=count, rng=rng):
         rotation = rng.uniform(0.0, 2.0 * np.pi)
         shape: LensShape = {"kind": kind, "x": x, "y": y, "radius": radius}
         if kind == "rectangle":
-            shape["width"] = radius * rng.uniform(1.6, 2.5)
-            shape["height"] = radius * rng.uniform(1.6, 2.5)
+            shape["width"] = radius * RECTANGLE_SIZE_MULTIPLIER
+            shape["height"] = radius * RECTANGLE_SIZE_MULTIPLIER
             shape["rotation"] = rotation
         elif kind == "triangle":
             shape["rotation"] = rotation
         elif kind == "star":
-            shape["inner_radius"] = radius * rng.uniform(0.42, 0.55)
+            shape["inner_radius"] = radius * STAR_INNER_RADIUS_MULTIPLIER
             shape["points"] = 5
             shape["rotation"] = rotation
         shapes.append(shape)
@@ -213,6 +224,143 @@ def star_points(
         axis=1,
     )
     return np.round(points).astype(np.int32)
+
+
+def catmull_rom_point(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, t: float) -> np.ndarray:
+    t2 = t * t
+    t3 = t2 * t
+    return 0.5 * (
+        (2.0 * p1)
+        + (-p0 + p2) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+    )
+
+
+def catmull_rom_path(
+    control_points: list[Point],
+    n_frames: int,
+    bounds: tuple[float, float, float, float] | None = None,
+) -> list[Point]:
+    if n_frames <= 0:
+        return []
+    if len(control_points) < 2:
+        raise ValueError("At least two control points are required")
+
+    points = np.asarray(control_points, dtype=np.float32)
+    if n_frames == 1:
+        path = points[:1]
+    else:
+        segment_count = len(points) - 1
+        positions = np.linspace(0.0, segment_count, n_frames, endpoint=True)
+        path_values: list[np.ndarray] = []
+        for position in positions:
+            segment_idx = min(int(np.floor(position)), segment_count - 1)
+            t = float(position - segment_idx)
+            p0 = points[max(segment_idx - 1, 0)]
+            p1 = points[segment_idx]
+            p2 = points[segment_idx + 1]
+            p3 = points[min(segment_idx + 2, len(points) - 1)]
+            path_values.append(catmull_rom_point(p0, p1, p2, p3, t))
+        path = np.stack(path_values, axis=0)
+
+    if bounds is not None:
+        min_x, min_y, max_x, max_y = bounds
+        path[:, 0] = np.clip(path[:, 0], min_x, max_x)
+        path[:, 1] = np.clip(path[:, 1], min_y, max_y)
+
+    return [(float(x), float(y)) for x, y in path]
+
+
+def make_moving_shape_path(
+    n_frames: int,
+    out_w: int,
+    out_h: int,
+    radius: float,
+    control_point_count: int | None = None,
+    min_control_point_distance: float = MOVING_SHAPE_MIN_CONTROL_POINT_DISTANCE,
+    max_control_point_distance: float = MOVING_SHAPE_MAX_CONTROL_POINT_DISTANCE,
+    rng: random.Random | None = None,
+) -> list[Point]:
+    rng = rng or random
+    if min_control_point_distance > max_control_point_distance:
+        raise ValueError("min_control_point_distance must be <= max_control_point_distance")
+    control_point_count = control_point_count or rng.randint(6, 10)
+
+    margin = max(1.0, radius * 0.8)
+    bounds = (margin, margin, out_w - margin, out_h - margin)
+    center = (out_w * 0.5, out_h * 0.5)
+    control_points = [center]
+    for _ in range(max(1, control_point_count - 1)):
+        prev_x, prev_y = control_points[-1]
+        for _ in range(1000):
+            point = (
+                rng.uniform(bounds[0], bounds[2]),
+                rng.uniform(bounds[1], bounds[3]),
+            )
+            distance = np.hypot(point[0] - prev_x, point[1] - prev_y)
+            if min_control_point_distance <= distance <= max_control_point_distance:
+                break
+        else:
+            angle = rng.uniform(0.0, 2.0 * np.pi)
+            distance = rng.uniform(min_control_point_distance, max_control_point_distance)
+            point = (
+                np.clip(prev_x + distance * np.cos(angle), bounds[0], bounds[2]),
+                np.clip(prev_y + distance * np.sin(angle), bounds[1], bounds[3]),
+            )
+        control_points.append(point)
+
+    return catmull_rom_path(control_points, n_frames, bounds=bounds)
+
+
+def make_shape_at_position(template: LensShape, center_x: float, center_y: float) -> LensShape:
+    shape = dict(template)
+    shape["x"] = center_x
+    shape["y"] = center_y
+    return shape
+
+
+def add_shape_rotation(shape: LensShape, rotation_delta: float) -> LensShape:
+    rotated = dict(shape)
+    kind = str(rotated.get("kind", "circle")).lower()
+    if kind in {"rectangle", "rect", "square", "triangle", "star"}:
+        rotated["rotation"] = float(rotated.get("rotation", 0.0)) + rotation_delta
+    return rotated
+
+
+def add_shape_fill(
+    shape: LensShape,
+    color: tuple[int, int, int],
+    alpha: float,
+) -> LensShape:
+    filled = dict(shape)
+    filled["fill_r"] = color[0]
+    filled["fill_g"] = color[1]
+    filled["fill_b"] = color[2]
+    filled["fill_alpha"] = alpha
+    return filled
+
+
+def make_moving_shape_template(
+    kind: str,
+    radius: float,
+    rng: random.Random | None = None,
+) -> LensShape:
+    rng = rng or random
+    rotation = rng.uniform(0.0, 2.0 * np.pi)
+    shape: LensShape = {"kind": kind, "x": 0.0, "y": 0.0, "radius": radius}
+    if kind == "rectangle":
+        side = radius * RECTANGLE_SIZE_MULTIPLIER
+        shape["width"] = side
+        shape["height"] = side
+        shape["rotation"] = rotation
+    elif kind == "triangle":
+        shape["rotation"] = rotation
+    elif kind == "star":
+        shape["inner_radius"] = radius * STAR_INNER_RADIUS_MULTIPLIER
+        shape["points"] = 5
+        shape["rotation"] = rotation
+    return shape
 
 
 def draw_lens_shape(mask: np.ndarray, shape: LensShape) -> None:
@@ -282,6 +430,39 @@ def make_lens_mask(
     return mask
 
 
+def apply_shape_fills(
+    frame: np.ndarray,
+    shapes: list[LensShape],
+    crop_left: int = 0,
+    crop_top: int = 0,
+) -> np.ndarray:
+    out = frame.astype(np.float32)
+    h, w = frame.shape[:2]
+    for shape in shapes:
+        alpha = float(shape.get("fill_alpha", 0.0))
+        if alpha <= 0.0:
+            continue
+
+        shifted = dict(shape)
+        shifted["x"] = float(shifted.get("x", 0.0)) - crop_left
+        shifted["y"] = float(shifted.get("y", 0.0)) - crop_top
+        mask = np.zeros((h, w), dtype=np.uint8)
+        draw_lens_shape(mask, shifted)
+
+        alpha_mask = (mask.astype(np.float32) / 255.0) * np.clip(alpha, 0.0, 1.0)
+        color = np.array(
+            [
+                float(shape.get("fill_r", 255.0)),
+                float(shape.get("fill_g", 255.0)),
+                float(shape.get("fill_b", 255.0)),
+            ],
+            dtype=np.float32,
+        )
+        out = out * (1.0 - alpha_mask[..., None]) + color * alpha_mask[..., None]
+
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def _smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
     t = np.clip((x - edge0) / (edge1 - edge0 + 1e-6), 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
@@ -293,10 +474,9 @@ def apply_lens_mask(
     rim_width: float = 12.0,
     outer_shadow_width: float = 18.0,
     magnification: float = 1.07,
-    rim_refraction: float = 12.0,
-    outer_line_darkness: float = 0.34,
+    rim_refraction: float = LENS_RIM_REFRACTION,
+    outer_line_darkness: float = LENS_OUTER_LINE_DARKNESS,
     inner_line_brightness: float = 0.24,
-    glass_rim_brightness: float = 0.025,
     outer_line_offset: float = 1.6,
     inner_line_offset: float = 2.2,
     outer_line_softness: float = 0.85,
@@ -410,69 +590,27 @@ def apply_lens_mask(
             -((sdf - inner_line_offset) ** 2)
             / (2.0 * inner_line_softness * inner_line_softness + 1e-6)
         )
-        inner_glass_rim = np.clip(1.0 - inside_dist / max(rim_width, 1e-6), 0.0, 1.0)
-        inner_glass_rim = _smoothstep(0.0, 1.0, inner_glass_rim) * alpha
         outer_ring_alpha = np.clip(outer_line_darkness * outer_dark_line * (1.0 - alpha), 0.0, 1.0)
         inner_ring_alpha = np.clip(inner_line_brightness * inner_bright_line * alpha, 0.0, 1.0)
-        glass_rim_alpha = np.clip(glass_rim_brightness * inner_glass_rim, 0.0, 1.0)
 
         dark_color = np.array([0.035, 0.035, 0.035], dtype=np.float32)
         bright_color = np.array([0.92, 0.92, 0.92], dtype=np.float32)
-        glass_color = np.array([0.72, 0.76, 0.78], dtype=np.float32)
 
         roi_out[:] = roi_out * (1.0 - outer_ring_alpha[..., None]) + dark_color * outer_ring_alpha[..., None]
         roi_out[:] = roi_out * (1.0 - inner_ring_alpha[..., None]) + bright_color * inner_ring_alpha[..., None]
-        roi_out[:] = roi_out * (1.0 - glass_rim_alpha[..., None]) + glass_color * glass_rim_alpha[..., None]
 
         rim_band = np.clip(1.0 - inside_dist / max(rim_width, 1e-6), 0.0, 1.0)
         rim_band = _smoothstep(0.0, 1.0, rim_band) * alpha
         lx, ly = -0.7071, -0.7071
         ndotl = -(nx * lx + ny * ly)
 
-        highlight = np.clip(ndotl, 0.0, 1.0) * rim_band
         darkside = np.clip(-ndotl, 0.0, 1.0) * rim_band
 
-        roi_out[:] += 0.18 * highlight[..., None]
-        roi_out[:] -= 0.14 * darkside[..., None]
-
-        if rim_width > 1.0:
-            target = 0.65 * rim_width
-            sigma = max(1.0, 0.35 * rim_width)
-            spec_band = np.exp(-((inside_dist - target) ** 2) / (2.0 * sigma * sigma + 1e-6))
-            spec = spec_band * (np.clip(ndotl, 0.0, 1.0) ** 2) * alpha
-            roi_out[:] += 0.08 * spec[..., None]
+        roi_out[:] -= LENS_DARKSIDE_STRENGTH * darkside[..., None]
 
         out[y0:y1, x0:x1] = np.clip(roi_out, 0.0, 1.0)
 
     return (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
-
-
-def apply_lens_circle(
-    frame: np.ndarray,
-    center_x: float,
-    center_y: float,
-    radius: float,
-    outer_line_darkness: float = 0.34,
-    inner_line_brightness: float = 0.24,
-    glass_rim_brightness: float = 0.025,
-    outer_line_offset: float = 1.6,
-    inner_line_offset: float = 2.2,
-    outer_line_softness: float = 0.85,
-    inner_line_softness: float = 0.95,
-) -> np.ndarray:
-    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-    draw_lens_shape(mask, {"kind": "circle", "x": center_x, "y": center_y, "radius": radius})
-    return apply_lens_mask(
-        frame,
-        mask,
-        outer_line_darkness=outer_line_darkness,
-        inner_line_brightness=inner_line_brightness,
-        glass_rim_brightness=glass_rim_brightness,
-        outer_line_offset=outer_line_offset,
-        inner_line_offset=inner_line_offset,
-        outer_line_softness=outer_line_softness,
-        inner_line_softness=inner_line_softness,
-    )
 
 
 def apply_lens_shapes(
@@ -481,9 +619,8 @@ def apply_lens_shapes(
     crop_left: int = 0,
     crop_top: int = 0,
     source_size: tuple[int, int] | None = None,
-    outer_line_darkness: float = 0.34,
+    outer_line_darkness: float = LENS_OUTER_LINE_DARKNESS,
     inner_line_brightness: float = 0.24,
-    glass_rim_brightness: float = 0.025,
     outer_line_offset: float = 1.6,
     inner_line_offset: float = 2.2,
     outer_line_softness: float = 0.85,
@@ -494,7 +631,7 @@ def apply_lens_shapes(
 
     if shapes is None:
         source_w, source_h = source_size or (out_w, out_h)
-        shapes = default_lens_shapes(source_w, source_h)
+        shapes = get_shapes(source_w, source_h)
 
     effect_margin = 80
     padded_frame = cv2.copyMakeBorder(
@@ -504,6 +641,12 @@ def apply_lens_shapes(
         effect_margin,
         effect_margin,
         borderType=cv2.BORDER_REFLECT_101,
+    )
+    padded_frame = apply_shape_fills(
+        padded_frame,
+        shapes,
+        crop_left=crop_left - effect_margin,
+        crop_top=crop_top - effect_margin,
     )
     padded_h, padded_w = padded_frame.shape[:2]
     mask = make_lens_mask(
@@ -518,7 +661,6 @@ def apply_lens_shapes(
         mask,
         outer_line_darkness=outer_line_darkness,
         inner_line_brightness=inner_line_brightness,
-        glass_rim_brightness=glass_rim_brightness,
         outer_line_offset=outer_line_offset,
         inner_line_offset=inner_line_offset,
         outer_line_softness=outer_line_softness,
@@ -531,45 +673,6 @@ def apply_lens_shapes(
     return Image.fromarray(frame, mode="RGB")
 
 
-def apply_lens_circles(
-    image: Image.Image,
-    circles: list[tuple[float, float, float]] | None = None,
-    crop_left: int = 0,
-    crop_top: int = 0,
-    source_size: tuple[int, int] | None = None,
-    outer_line_darkness: float = 0.34,
-    inner_line_brightness: float = 0.24,
-    glass_rim_brightness: float = 0.025,
-    outer_line_offset: float = 1.6,
-    inner_line_offset: float = 2.2,
-    outer_line_softness: float = 0.85,
-    inner_line_softness: float = 0.95,
-) -> Image.Image:
-    if circles is None:
-        out_w, out_h = image.size
-        source_w, source_h = source_size or (out_w, out_h)
-        circles = default_lens_circles(source_w, source_h)
-
-    shapes = [
-        {"kind": "circle", "x": center_x, "y": center_y, "radius": radius}
-        for center_x, center_y, radius in circles
-    ]
-    return apply_lens_shapes(
-        image,
-        shapes=shapes,
-        crop_left=crop_left,
-        crop_top=crop_top,
-        source_size=source_size,
-        outer_line_darkness=outer_line_darkness,
-        inner_line_brightness=inner_line_brightness,
-        glass_rim_brightness=glass_rim_brightness,
-        outer_line_offset=outer_line_offset,
-        inner_line_offset=inner_line_offset,
-        outer_line_softness=outer_line_softness,
-        inner_line_softness=inner_line_softness,
-    )
-
-
 def make_target(
     n_frames: int,
     texture: Image.Image | np.ndarray | None = None,
@@ -580,13 +683,17 @@ def make_target(
     period_y: float = 300.0,
     orbit_radius: float = 100.0,
     orbit_speed: float = 1.2,
-    outer_line_darkness: float = 0.34,
+    outer_line_darkness: float = LENS_OUTER_LINE_DARKNESS,
     inner_line_brightness: float = 0.24,
-    glass_rim_brightness: float = 0.025,
     outer_line_offset: float = 1.6,
     inner_line_offset: float = 2.2,
     outer_line_softness: float = 0.85,
     inner_line_softness: float = 0.95,
+    add_moving_shape: bool = True,
+    moving_shape_radius: float | None = None,
+    moving_shape_control_points: int | None = None,
+    moving_shape_min_control_point_distance: float = MOVING_SHAPE_MIN_CONTROL_POINT_DISTANCE,
+    moving_shape_max_control_point_distance: float = MOVING_SHAPE_MAX_CONTROL_POINT_DISTANCE,
 ) -> list[Image.Image]:
     if texture is None:
         texture, _ = make_base_image()
@@ -594,7 +701,20 @@ def make_target(
         source_w, source_h = texture.size
     else:
         source_h, source_w = texture.shape[:2]
-    lens_shapes = default_lens_shapes(source_w, source_h)
+    lens_shapes = get_shapes(source_w, source_h)
+    shape_kind = str(lens_shapes[0].get("kind", "circle"))
+    moving_radius = moving_shape_radius or LENS_RADIUS_RATIO * min(source_w, source_h)
+    moving_shape_template = make_moving_shape_template(shape_kind, moving_radius)
+    moving_shape_path = make_moving_shape_path(
+        n_frames,
+        out_w,
+        out_h,
+        moving_radius,
+        control_point_count=moving_shape_control_points,
+        min_control_point_distance=moving_shape_min_control_point_distance,
+        max_control_point_distance=moving_shape_max_control_point_distance,
+    )
+    moving_shape_fade_frames = max(1, round(fps * MOVING_SHAPE_FADE_SECONDS))
 
     frames: list[Image.Image] = []
     for frame_idx in range(n_frames):
@@ -613,15 +733,27 @@ def make_target(
         theta = orbit_speed * t
         crop_left = round(source_w * 0.5 + orbit_radius * np.cos(theta) - out_w * 0.5)
         crop_top = round(source_h * 0.5 + orbit_radius * np.sin(theta) - out_h * 0.5)
+        frame_lens_shapes = lens_shapes
+        if add_moving_shape:
+            shape_x, shape_y = moving_shape_path[frame_idx]
+            moving_lens_shape = make_shape_at_position(
+                moving_shape_template,
+                shape_x + crop_left,
+                shape_y + crop_top,
+            )
+            rotation_delta = 2.0 * np.pi * frame_idx / MOVING_SHAPE_ROTATION_PERIOD_FRAMES
+            fill_alpha = max(0.0, 1.0 - frame_idx / moving_shape_fade_frames)
+            moving_lens_shape = add_shape_rotation(moving_lens_shape, rotation_delta)
+            moving_lens_shape = add_shape_fill(moving_lens_shape, (255, 255, 255), fill_alpha)
+            frame_lens_shapes = [*lens_shapes, moving_lens_shape]
         frame = apply_lens_shapes(
             frame,
-            shapes=lens_shapes,
+            shapes=frame_lens_shapes,
             crop_left=crop_left,
             crop_top=crop_top,
             source_size=(source_w, source_h),
             outer_line_darkness=outer_line_darkness,
             inner_line_brightness=inner_line_brightness,
-            glass_rim_brightness=glass_rim_brightness,
             outer_line_offset=outer_line_offset,
             inner_line_offset=inner_line_offset,
             outer_line_softness=outer_line_softness,
