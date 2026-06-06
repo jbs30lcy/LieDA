@@ -50,7 +50,27 @@ class ConvBlock(nn.Module):
         return self.net(x)
 
 
-class LieDA(nn.Module):
+class DecodeBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, skip_channels: int = 0) -> None:
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.conv = nn.Sequential(
+            nn.Conv2d(out_channels + skip_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: Tensor, skip: Tensor | None = None) -> Tensor:
+        x = self.up(x)
+        if skip is not None:
+            x = torch.cat((x, skip), dim=1)
+        return self.conv(x)
+
+
+class TinyLieDA(nn.Module):
     """Small heatmap + offset tracker for 416x416 temporal crops."""
 
     def __init__(
@@ -80,6 +100,53 @@ class LieDA(nn.Module):
             heatmap=self.heatmap_head(features),
             offset=self.offset_head(features),
         )
+
+
+class SkipLieDA(nn.Module):
+    """U-Net style heatmap-only tracker for 416x416 temporal crops."""
+
+    def __init__(
+        self,
+        in_channels: int = 9,
+        channels: tuple[int, ...] = (32, 64, 128, 192, 256),
+        heatmap_channels: int = 1,
+    ) -> None:
+        super().__init__()
+        if len(channels) != 5:
+            raise ValueError("channels must contain 5 stages so 416x416 becomes 13x13.")
+
+        encoder_blocks: list[nn.Module] = []
+        prev_channels = in_channels
+        for next_channels in channels:
+            encoder_blocks.append(ConvBlock(prev_channels, next_channels))
+            prev_channels = next_channels
+        self.encoder = nn.ModuleList(encoder_blocks)
+
+        c1, c2, c3, c4, c5 = channels
+        self.decoder = nn.ModuleList(
+            [
+                DecodeBlock(c5, c4, skip_channels=c4),
+                DecodeBlock(c4, c3, skip_channels=c3),
+                DecodeBlock(c3, c2, skip_channels=c2),
+                DecodeBlock(c2, c1, skip_channels=c1),
+                DecodeBlock(c1, c1),
+            ]
+        )
+        self.heatmap_head = nn.Conv2d(c1, heatmap_channels, kernel_size=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        skips: list[Tensor] = []
+        features = x
+        for block in self.encoder:
+            features = block(features)
+            skips.append(features)
+
+        features = self.decoder[0](features, skips[3])
+        features = self.decoder[1](features, skips[2])
+        features = self.decoder[2](features, skips[1])
+        features = self.decoder[3](features, skips[0])
+        features = self.decoder[4](features)
+        return self.heatmap_head(features)
 
 
 def make_distance_squared_map(
@@ -135,7 +202,7 @@ def apply_distance_bias(
 
 @torch.no_grad()
 def decode_centers(
-    output: TrackerOutput,
+    output: TrackerOutput | Tensor,
     *,
     input_size: int = 416,
     use_distance_bias: bool = False,
@@ -145,11 +212,12 @@ def decode_centers(
 ) -> Tensor:
     """Decodes coarse argmax + local offset into crop-local pixel centers.
 
-    Offset is interpreted in output-grid cell units. The returned tensor is
-    shaped (B, 2) and ordered as (x, y) in the input crop coordinate system.
+    If offset is present, it is interpreted in output-grid cell units. The
+    returned tensor is shaped (B, 2) and ordered as (x, y) in the input crop
+    coordinate system.
     """
-    heatmap = output.heatmap
-    offset = output.offset
+    heatmap = output.heatmap if isinstance(output, TrackerOutput) else output
+    offset = output.offset if isinstance(output, TrackerOutput) else None
     batch_size, _, height, width = heatmap.shape
     stride = input_size / float(width)
 
@@ -164,12 +232,18 @@ def decode_centers(
     ys = torch.div(flat_indices, width, rounding_mode="floor")
     xs = flat_indices.remainder(width)
 
-    batch_indices = torch.arange(batch_size, device=heatmap.device)
-    dx = offset[batch_indices, 0, ys, xs]
-    dy = offset[batch_indices, 1, ys, xs]
+    if offset is None:
+        dx = torch.zeros(batch_size, device=heatmap.device, dtype=heatmap.dtype)
+        dy = torch.zeros(batch_size, device=heatmap.device, dtype=heatmap.dtype)
+        center_dtype = heatmap.dtype
+    else:
+        batch_indices = torch.arange(batch_size, device=heatmap.device)
+        dx = offset[batch_indices, 0, ys, xs]
+        dy = offset[batch_indices, 1, ys, xs]
+        center_dtype = offset.dtype
 
-    centers_x = (xs.to(offset.dtype) + 0.5 + dx) * stride
-    centers_y = (ys.to(offset.dtype) + 0.5 + dy) * stride
+    centers_x = (xs.to(center_dtype) + 0.5 + dx) * stride
+    centers_y = (ys.to(center_dtype) + 0.5 + dy) * stride
     return torch.stack((centers_x, centers_y), dim=1)
 
 
@@ -301,7 +375,7 @@ def make_heatmap_and_offset_targets(
 
 
 def compute_tracking_loss(
-    output: TrackerOutput,
+    output: TrackerOutput | Tensor,
     target_centers: Tensor,
     *,
     crop_size: int,
@@ -312,25 +386,30 @@ def compute_tracking_loss(
     use_distance_bias: bool = False,
     gamma: float = 0.0,
 ) -> LossOutput:
+    heatmap = output.heatmap if isinstance(output, TrackerOutput) else output
     biased_heatmap = apply_distance_bias(
-        output.heatmap,
+        heatmap,
         gamma=gamma,
         enabled=use_distance_bias,
     )
     target_heatmap, target_offset, offset_mask = make_heatmap_and_offset_targets(
         target_centers,
         input_size=crop_size,
-        output_height=output.heatmap.shape[-2],
-        output_width=output.heatmap.shape[-1],
+        output_height=heatmap.shape[-2],
+        output_width=heatmap.shape[-1],
         sigma=heatmap_sigma,
     )
     heatmap_loss = heatmap_loss_fn(biased_heatmap, target_heatmap)
-    offset_difference = output.offset - target_offset
-    offset_loss = offset_loss_fn(
-        offset_difference * offset_mask,
-        torch.zeros_like(offset_difference),
-    ) / offset_mask.sum().clamp_min(1.0)
-    loss = heatmap_loss + offset_loss_weight * offset_loss
+    if isinstance(output, TrackerOutput):
+        offset_difference = output.offset - target_offset
+        offset_loss = offset_loss_fn(
+            offset_difference * offset_mask,
+            torch.zeros_like(offset_difference),
+        ) / offset_mask.sum().clamp_min(1.0)
+        loss = heatmap_loss + offset_loss_weight * offset_loss
+    else:
+        offset_loss = heatmap_loss.new_zeros(())
+        loss = heatmap_loss
     return LossOutput(
         loss=loss,
         heatmap_loss=heatmap_loss,
@@ -345,6 +424,112 @@ def make_run_dir(root: str | Path = "runs") -> Path:
     (run_dir / "eval").mkdir()
     (run_dir / "checkpoints").mkdir()
     return run_dir
+
+
+def save_checkpoint(
+    model: Any,
+    optimizer: torch.optim.Optimizer,
+    path: str | Path,
+    *,
+    step: int,
+    config: dict[str, Any],
+) -> Path:
+    checkpoint_path = Path(path)
+    torch.save(
+        {
+            "step": step,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "config": config,
+        },
+        checkpoint_path,
+    )
+    return checkpoint_path
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _checkpoint_sort_key(path: Path) -> tuple[float, str]:
+    return (path.stat().st_mtime, str(path))
+
+
+def _run_dir_for_checkpoint(checkpoint: Path, run_root: Path) -> Path:
+    relative_path = checkpoint.resolve().relative_to(run_root)
+    if len(relative_path.parts) < 2:
+        raise ValueError(f"Checkpoint must be inside a run directory: {checkpoint}.")
+    return run_root / relative_path.parts[0]
+
+
+def _find_latest_checkpoint(run_root: str | Path = "runs") -> Path:
+    runs_root = Path(run_root).resolve()
+    checkpoints = [path for path in runs_root.rglob("*.pt") if path.is_file()]
+    if not checkpoints:
+        raise FileNotFoundError(f"No .pt checkpoint found under {runs_root}.")
+
+    newest_run = max(
+        {_run_dir_for_checkpoint(checkpoint, runs_root) for checkpoint in checkpoints},
+        key=lambda path: (path.stat().st_mtime, path.name),
+    )
+    run_checkpoints = [
+        checkpoint
+        for checkpoint in checkpoints
+        if _is_relative_to(checkpoint.resolve(), newest_run.resolve())
+    ]
+    if not run_checkpoints:
+        raise FileNotFoundError(f"No .pt checkpoint found under latest run {newest_run}.")
+    return max(run_checkpoints, key=_checkpoint_sort_key)
+
+
+def _resolve_params_path(params: str | Path, run_root: str | Path = "runs") -> Path:
+    if str(params) == "latest":
+        return _find_latest_checkpoint(run_root)
+
+    checkpoint_path = Path(params)
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = Path.cwd() / checkpoint_path
+    checkpoint_path = checkpoint_path.resolve()
+    runs_root = Path(run_root).resolve()
+    if checkpoint_path.suffix != ".pt":
+        raise ValueError(f"params must point to a .pt file, got {checkpoint_path}.")
+    if not _is_relative_to(checkpoint_path, runs_root):
+        raise ValueError(f"params must be a .pt path under {runs_root}, got {checkpoint_path}.")
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"params checkpoint does not exist: {checkpoint_path}.")
+    return checkpoint_path
+
+
+def load_checkpoint(
+    model: Any,
+    optimizer: torch.optim.Optimizer | None,
+    params: str | Path,
+    *,
+    device: torch.device,
+    run_root: str | Path = "runs",
+) -> dict[str, Any]:
+    checkpoint_path = _resolve_params_path(params, run_root)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"])
+        if optimizer is not None and "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            for state in optimizer.state.values():
+                for key, value in state.items():
+                    if torch.is_tensor(value):
+                        state[key] = value.to(device)
+        loaded_step = int(checkpoint.get("step", 0))
+    else:
+        model.load_state_dict(checkpoint)
+        loaded_step = 0
+        checkpoint = {"step": loaded_step}
+
+    print(f"[train] params loaded: {checkpoint_path} (step={loaded_step})")
+    return checkpoint
 
 
 def _frames_to_uint8_hwc(frames: Tensor) -> np.ndarray:
@@ -520,6 +705,7 @@ def eval(
 
     if was_training:
         model.train()
+    print(f"[eval] done: {name} metrics={metrics_path} video={video_path}")
     return metrics
 
 
@@ -528,6 +714,7 @@ def train(
     dataloader: DataLoader | None = None,
     *,
     device: torch.device | str | None = None,
+    params: str | Path | None = None,
     steps: int = 100,
     batch: int = 16,
     lr: float = 1e-3,
@@ -547,9 +734,21 @@ def train(
     else:
         device = torch.device(device)
 
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
     model.to(device)
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    loaded_checkpoint: dict[str, Any] | None = None
+    if params is not None:
+        loaded_checkpoint = load_checkpoint(
+            model,
+            optimizer,
+            params,
+            device=device,
+            run_root=run_root,
+        )
     heatmap_loss_fn = nn.BCEWithLogitsLoss()
     offset_loss_fn = nn.SmoothL1Loss(reduction="sum")
     if dataloader is None:
@@ -560,6 +759,7 @@ def train(
         )
 
     run_dir = make_run_dir(run_root)
+    print(f"[train] run directory: {run_dir}")
     wandb_run = None
     if wandb_active:
         try:
@@ -578,6 +778,8 @@ def train(
                 "eval_step": eval_step,
                 "save_step": save_step,
                 "run_dir": str(run_dir),
+                "params": None if params is None else str(params),
+                "loaded_step": None if loaded_checkpoint is None else loaded_checkpoint.get("step", 0),
                 "heatmap_sigma": heatmap_sigma,
                 "offset_loss_weight": offset_loss_weight,
                 "use_distance_bias": use_distance_bias,
@@ -587,6 +789,22 @@ def train(
 
     data_iter = iter(dataloader)
     progress = tqdm(range(steps), desc="train", unit="step")
+    checkpoint_config = {
+        "batch": batch,
+        "lr": lr,
+        "crop_size": crop_size,
+        "heatmap_sigma": heatmap_sigma,
+        "offset_loss_weight": offset_loss_weight,
+        "use_distance_bias": use_distance_bias,
+        "gamma": gamma,
+        "params": None if params is None else str(params),
+        "loaded_step": None if loaded_checkpoint is None else loaded_checkpoint.get("step", 0),
+    }
+    last_saved_step = 0
+    completed_steps = 0
+    best_step_loss = float("inf")
+    steps_without_improvement = 0
+    early_stop_patience = 5
     for step in progress:
         batch_data = next(data_iter)
         frames = _batch_inputs(batch_data).to(device, non_blocking=True)
@@ -667,25 +885,35 @@ def train(
         if wandb_run is not None:
             wandb_run.log(step_metrics, step=(step + 1) * (frames.shape[1] - 2))
 
+        completed_steps = step + 1
+        if step_metrics["step_loss"] < best_step_loss:
+            best_step_loss = step_metrics["step_loss"]
+            steps_without_improvement = 0
+        else:
+            steps_without_improvement += 1
+            print(
+                f"[train] no loss improvement for "
+                f"{steps_without_improvement}/{early_stop_patience} steps "
+                f"(best={best_step_loss:.6f})"
+            )
+            if steps_without_improvement >= early_stop_patience:
+                print(
+                    f"[train] early stop: loss did not improve for "
+                    f"{early_stop_patience} steps."
+                )
+                break
+
         if save_step > 0 and (step + 1) % save_step == 0:
             checkpoint_path = run_dir / "checkpoints" / f"step_{step + 1:06d}.pt"
-            torch.save(
-                {
-                    "step": step + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "config": {
-                        "batch": batch,
-                        "lr": lr,
-                        "crop_size": crop_size,
-                        "heatmap_sigma": heatmap_sigma,
-                        "offset_loss_weight": offset_loss_weight,
-                        "use_distance_bias": use_distance_bias,
-                        "gamma": gamma,
-                    },
-                },
+            save_checkpoint(
+                model,
+                optimizer,
                 checkpoint_path,
+                step=step + 1,
+                config=checkpoint_config,
             )
+            last_saved_step = step + 1
+            print(f"[train] checkpoint saved: {checkpoint_path}")
 
         if eval_step > 0 and (step + 1) % eval_step == 0:
             eval_metrics = eval(
@@ -721,10 +949,21 @@ def train(
 
     if wandb_run is not None:
         wandb_run.finish()
+    if completed_steps > 0 and last_saved_step != completed_steps:
+        checkpoint_path = run_dir / "checkpoints" / f"step_{completed_steps:06d}_final.pt"
+        save_checkpoint(
+            model,
+            optimizer,
+            checkpoint_path,
+            step=completed_steps,
+            config=checkpoint_config,
+        )
+        print(f"[train] final checkpoint saved: {checkpoint_path}")
+    print(f"[train] done: {run_dir}")
     return run_dir
 
 
 if __name__ == '__main__':
-    model = LieDA()
-    dataloader = my_dataloader(difficulty=1)
-    train(model, dataloader)
+    model = TinyLieDA()
+    train(model, steps = 100, batch = 4, eval_step = 10, save_step = 10, use_distance_bias=True, gamma=-0.01)
+    

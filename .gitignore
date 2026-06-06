@@ -7,5 +7,6 @@ __pycache__/
 .ipynb_checkpoints/
 build/
 dist/
+!runs/.gitkeep
 .vscode/
 desktop.ini
