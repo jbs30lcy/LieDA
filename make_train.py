@@ -1,4 +1,5 @@
 from pathlib import Path
+from dataclasses import dataclass
 import random
 import re
 
@@ -6,6 +7,7 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image, ImageFilter
+from alchemy import *
 
 
 SCALE_PATTERN = re.compile(r"scale_(\d+)_")
@@ -17,11 +19,29 @@ MOVING_SHAPE_ROTATION_PERIOD_FRAMES = 45
 MOVING_SHAPE_FADE_SECONDS = 2.0
 LENS_RIM_REFRACTION = 0.0
 LENS_OUTER_LINE_DARKNESS = 0.40
-LENS_DARKSIDE_STRENGTH = 0.14
 MOVING_SHAPE_MIN_CONTROL_POINT_DISTANCE = 50.0
 MOVING_SHAPE_MAX_CONTROL_POINT_DISTANCE = 300.0
 LensShape = dict[str, float | int | str]
 Point = tuple[float, float]
+
+
+@dataclass(frozen=True)
+class DistortionEffect:
+    period_x: float = 200.0
+    period_y: float = 300.0
+    orbit_radius: float = 100.0
+    orbit_speed: float = 1.2
+    outer_line_darkness: float = LENS_OUTER_LINE_DARKNESS
+    inner_line_brightness: float = 0.24
+    outer_line_offset: float = 1.6
+    inner_line_offset: float = 2.2
+    outer_line_softness: float = 0.85
+    inner_line_softness: float = 0.95
+    add_moving_shape: bool = True
+    moving_shape_radius: float | None = None
+    moving_shape_control_points: int | None = None
+    moving_shape_min_control_point_distance: float = MOVING_SHAPE_MIN_CONTROL_POINT_DISTANCE
+    moving_shape_max_control_point_distance: float = MOVING_SHAPE_MAX_CONTROL_POINT_DISTANCE
 
 
 def make_base_image(
@@ -66,17 +86,16 @@ def make_base_image(
 
     return image, image_path
 
+
 def make_distorted_background(
     texture: Image.Image | np.ndarray,
     frame_idx: int,
     out_w: int,
     out_h: int,
     fps: int = 30,
-    period_x: float = 200.0,
-    period_y: float = 300.0,
-    orbit_radius: float = 100.0,
-    orbit_speed: float = 1.2,
+    effect: DistortionEffect | None = None,
 ) -> Image.Image:
+    effect = effect or DistortionEffect()
     if isinstance(texture, Image.Image):
         texture_array = np.asarray(texture.convert("RGB"))
     else:
@@ -96,8 +115,8 @@ def make_distorted_background(
     center_x = 50.0
     center_y = 50.0
 
-    kx = 2.0 * np.pi / period_x
-    ky = 2.0 * np.pi / period_y
+    kx = 2.0 * np.pi / effect.period_x
+    ky = 2.0 * np.pi / effect.period_y
     cx = np.cos(kx * (xr - center_x))
     cy = np.cos(ky * (yr - center_y))
     sx = np.sin(kx * (xr - center_x))
@@ -115,9 +134,9 @@ def make_distorted_background(
     dhdy *= scale
 
     distortion_strength = 180.0
-    theta = orbit_speed * t
-    sample_center_x = texture_w * 0.5 + orbit_radius * np.cos(theta)
-    sample_center_y = texture_h * 0.5 + orbit_radius * np.sin(theta)
+    theta = effect.orbit_speed * t
+    sample_center_x = texture_w * 0.5 + effect.orbit_radius * np.cos(theta)
+    sample_center_y = texture_h * 0.5 + effect.orbit_radius * np.sin(theta)
 
     u = xr + distortion_strength * dhdx + sample_center_x
     v = yr + distortion_strength * dhdy + sample_center_y
@@ -475,13 +494,9 @@ def apply_lens_mask(
     outer_shadow_width: float = 18.0,
     magnification: float = 1.07,
     rim_refraction: float = LENS_RIM_REFRACTION,
-    outer_line_darkness: float = LENS_OUTER_LINE_DARKNESS,
-    inner_line_brightness: float = 0.24,
-    outer_line_offset: float = 1.6,
-    inner_line_offset: float = 2.2,
-    outer_line_softness: float = 0.85,
-    inner_line_softness: float = 0.95,
+    effect: DistortionEffect | None = None,
 ) -> np.ndarray:
+    effect = effect or DistortionEffect()
     if mask.ndim == 3:
         mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
 
@@ -583,30 +598,21 @@ def apply_lens_mask(
 
         sdf = inside_dist - outside_dist
         outer_dark_line = np.exp(
-            -((sdf + outer_line_offset) ** 2)
-            / (2.0 * outer_line_softness * outer_line_softness + 1e-6)
+            -((sdf + effect.outer_line_offset) ** 2)
+            / (2.0 * effect.outer_line_softness * effect.outer_line_softness + 1e-6)
         )
         inner_bright_line = np.exp(
-            -((sdf - inner_line_offset) ** 2)
-            / (2.0 * inner_line_softness * inner_line_softness + 1e-6)
+            -((sdf - effect.inner_line_offset) ** 2)
+            / (2.0 * effect.inner_line_softness * effect.inner_line_softness + 1e-6)
         )
-        outer_ring_alpha = np.clip(outer_line_darkness * outer_dark_line * (1.0 - alpha), 0.0, 1.0)
-        inner_ring_alpha = np.clip(inner_line_brightness * inner_bright_line * alpha, 0.0, 1.0)
+        outer_ring_alpha = np.clip(effect.outer_line_darkness * outer_dark_line * (1.0 - alpha), 0.0, 1.0)
+        inner_ring_alpha = np.clip(effect.inner_line_brightness * inner_bright_line * alpha, 0.0, 1.0)
 
         dark_color = np.array([0.035, 0.035, 0.035], dtype=np.float32)
         bright_color = np.array([0.92, 0.92, 0.92], dtype=np.float32)
 
         roi_out[:] = roi_out * (1.0 - outer_ring_alpha[..., None]) + dark_color * outer_ring_alpha[..., None]
         roi_out[:] = roi_out * (1.0 - inner_ring_alpha[..., None]) + bright_color * inner_ring_alpha[..., None]
-
-        rim_band = np.clip(1.0 - inside_dist / max(rim_width, 1e-6), 0.0, 1.0)
-        rim_band = _smoothstep(0.0, 1.0, rim_band) * alpha
-        lx, ly = -0.7071, -0.7071
-        ndotl = -(nx * lx + ny * ly)
-
-        darkside = np.clip(-ndotl, 0.0, 1.0) * rim_band
-
-        roi_out[:] -= LENS_DARKSIDE_STRENGTH * darkside[..., None]
 
         out[y0:y1, x0:x1] = np.clip(roi_out, 0.0, 1.0)
 
@@ -619,13 +625,9 @@ def apply_lens_shapes(
     crop_left: int = 0,
     crop_top: int = 0,
     source_size: tuple[int, int] | None = None,
-    outer_line_darkness: float = LENS_OUTER_LINE_DARKNESS,
-    inner_line_brightness: float = 0.24,
-    outer_line_offset: float = 1.6,
-    inner_line_offset: float = 2.2,
-    outer_line_softness: float = 0.85,
-    inner_line_softness: float = 0.95,
+    effect: DistortionEffect | None = None,
 ) -> Image.Image:
+    effect = effect or DistortionEffect()
     frame = np.asarray(image.convert("RGB")).copy()
     out_h, out_w = frame.shape[:2]
 
@@ -659,12 +661,7 @@ def apply_lens_shapes(
     padded_frame = apply_lens_mask(
         padded_frame,
         mask,
-        outer_line_darkness=outer_line_darkness,
-        inner_line_brightness=inner_line_brightness,
-        outer_line_offset=outer_line_offset,
-        inner_line_offset=inner_line_offset,
-        outer_line_softness=outer_line_softness,
-        inner_line_softness=inner_line_softness,
+        effect=effect,
     )
     frame = padded_frame[
         effect_margin : effect_margin + out_h,
@@ -679,22 +676,9 @@ def make_target(
     out_w: int = 600,
     out_h: int = 600,
     fps: int = 30,
-    period_x: float = 200.0,
-    period_y: float = 300.0,
-    orbit_radius: float = 100.0,
-    orbit_speed: float = 1.2,
-    outer_line_darkness: float = LENS_OUTER_LINE_DARKNESS,
-    inner_line_brightness: float = 0.24,
-    outer_line_offset: float = 1.6,
-    inner_line_offset: float = 2.2,
-    outer_line_softness: float = 0.85,
-    inner_line_softness: float = 0.95,
-    add_moving_shape: bool = True,
-    moving_shape_radius: float | None = None,
-    moving_shape_control_points: int | None = None,
-    moving_shape_min_control_point_distance: float = MOVING_SHAPE_MIN_CONTROL_POINT_DISTANCE,
-    moving_shape_max_control_point_distance: float = MOVING_SHAPE_MAX_CONTROL_POINT_DISTANCE,
-) -> list[Image.Image]:
+    effect: DistortionEffect | None = None,
+) -> tuple[list[Image.Image], np.ndarray]:
+    effect = effect or DistortionEffect()
     if texture is None:
         texture, _ = make_base_image()
     if isinstance(texture, Image.Image):
@@ -703,17 +687,18 @@ def make_target(
         source_h, source_w = texture.shape[:2]
     lens_shapes = get_shapes(source_w, source_h)
     shape_kind = str(lens_shapes[0].get("kind", "circle"))
-    moving_radius = moving_shape_radius or LENS_RADIUS_RATIO * min(source_w, source_h)
+    moving_radius = effect.moving_shape_radius or LENS_RADIUS_RATIO * min(source_w, source_h)
     moving_shape_template = make_moving_shape_template(shape_kind, moving_radius)
     moving_shape_path = make_moving_shape_path(
         n_frames,
         out_w,
         out_h,
         moving_radius,
-        control_point_count=moving_shape_control_points,
-        min_control_point_distance=moving_shape_min_control_point_distance,
-        max_control_point_distance=moving_shape_max_control_point_distance,
+        control_point_count=effect.moving_shape_control_points,
+        min_control_point_distance=effect.moving_shape_min_control_point_distance,
+        max_control_point_distance=effect.moving_shape_max_control_point_distance,
     )
+    positions = np.asarray(moving_shape_path, dtype=np.float32)
     moving_shape_fade_frames = max(1, round(fps * MOVING_SHAPE_FADE_SECONDS))
 
     frames: list[Image.Image] = []
@@ -724,17 +709,14 @@ def make_target(
             out_w,
             out_h,
             fps=fps,
-            period_x=period_x,
-            period_y=period_y,
-            orbit_radius=orbit_radius,
-            orbit_speed=orbit_speed,
+            effect=effect,
         )
         t = frame_idx / fps
-        theta = orbit_speed * t
-        crop_left = round(source_w * 0.5 + orbit_radius * np.cos(theta) - out_w * 0.5)
-        crop_top = round(source_h * 0.5 + orbit_radius * np.sin(theta) - out_h * 0.5)
+        theta = effect.orbit_speed * t
+        crop_left = round(source_w * 0.5 + effect.orbit_radius * np.cos(theta) - out_w * 0.5)
+        crop_top = round(source_h * 0.5 + effect.orbit_radius * np.sin(theta) - out_h * 0.5)
         frame_lens_shapes = lens_shapes
-        if add_moving_shape:
+        if effect.add_moving_shape:
             shape_x, shape_y = moving_shape_path[frame_idx]
             moving_lens_shape = make_shape_at_position(
                 moving_shape_template,
@@ -752,27 +734,40 @@ def make_target(
             crop_left=crop_left,
             crop_top=crop_top,
             source_size=(source_w, source_h),
-            outer_line_darkness=outer_line_darkness,
-            inner_line_brightness=inner_line_brightness,
-            outer_line_offset=outer_line_offset,
-            inner_line_offset=inner_line_offset,
-            outer_line_softness=outer_line_softness,
-            inner_line_softness=inner_line_softness,
+            effect=effect,
         )
         frames.append(frame)
 
-    return frames
+    return frames, positions
 
 
 def play_image_list(
     images: list[Image.Image],
+    positions: np.ndarray | None = None,
     window_name: str = "frames",
     delay_ms: int = 33,
+    debug_box_size: int = 416,
+    debug_box_color: tuple[int, int, int] = (0, 255, 0),
 ) -> None:
     exit_key = False
     while not exit_key:
-        for image in images:
+        for frame_idx, image in enumerate(images):
             frame = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+            if positions is not None:
+                center_x, center_y = positions[frame_idx]
+                half_size = debug_box_size // 2
+                x0 = round(center_x - half_size)
+                y0 = round(center_y - half_size)
+                x1 = round(center_x + half_size)
+                y1 = round(center_y + half_size)
+                cv2.rectangle(
+                    frame,
+                    (x0, y0),
+                    (x1, y1),
+                    debug_box_color,
+                    thickness=2,
+                    lineType=cv2.LINE_AA,
+                )
             cv2.imshow(window_name, frame)
             cv2.waitKey(delay_ms)
             if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
@@ -783,8 +778,9 @@ def play_image_list(
 
 
 if __name__ == "__main__":
-    image, image_path = make_base_image()
+    image, image_path = make_base_image(data_dir="KTH_TIPS/aluminium_foil")
+    image, image_path = make_nothing()
     print(f"Selected image: {image_path}")
 
-    frames = make_target(n_frames=300, texture=image)
+    frames, positions = make_target(n_frames=300, texture=image)
     play_image_list(frames)
