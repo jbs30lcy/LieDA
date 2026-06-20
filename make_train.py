@@ -677,7 +677,8 @@ def make_target(
     out_h: int = 600,
     fps: int = 30,
     effect: DistortionEffect | None = None,
-) -> tuple[list[Image.Image], np.ndarray]:
+    dummy_shape_count: int = 16,
+) -> tuple[list[Image.Image], np.ndarray, np.ndarray, np.ndarray]:
     effect = effect or DistortionEffect()
     if texture is None:
         texture, _ = make_base_image()
@@ -685,7 +686,7 @@ def make_target(
         source_w, source_h = texture.size
     else:
         source_h, source_w = texture.shape[:2]
-    lens_shapes = get_shapes(source_w, source_h)
+    lens_shapes = get_shapes(source_w, source_h, count=dummy_shape_count)
     shape_kind = str(lens_shapes[0].get("kind", "circle"))
     moving_radius = effect.moving_shape_radius or LENS_RADIUS_RATIO * min(source_w, source_h)
     moving_shape_template = make_moving_shape_template(shape_kind, moving_radius)
@@ -702,6 +703,8 @@ def make_target(
     moving_shape_fade_frames = max(1, round(fps * MOVING_SHAPE_FADE_SECONDS))
 
     frames: list[Image.Image] = []
+    dummy_positions: list[np.ndarray] = []
+    dummy_masks: list[np.ndarray] = []
     for frame_idx in range(n_frames):
         frame = make_distorted_background(
             texture,
@@ -715,6 +718,22 @@ def make_target(
         theta = effect.orbit_speed * t
         crop_left = round(source_w * 0.5 + effect.orbit_radius * np.cos(theta) - out_w * 0.5)
         crop_top = round(source_h * 0.5 + effect.orbit_radius * np.sin(theta) - out_h * 0.5)
+        frame_dummy_positions = np.full((dummy_shape_count, 2), -1.0, dtype=np.float32)
+        frame_dummy_mask = np.zeros((dummy_shape_count,), dtype=np.bool_)
+        visible_dummy_positions = np.asarray(
+            [
+                [
+                    float(shape.get("x", 0.0)) - crop_left,
+                    float(shape.get("y", 0.0)) - crop_top,
+                ]
+                for shape in lens_shapes[:dummy_shape_count]
+            ],
+            dtype=np.float32,
+        )
+        frame_dummy_positions[: len(visible_dummy_positions)] = visible_dummy_positions
+        frame_dummy_mask[: len(visible_dummy_positions)] = True
+        dummy_positions.append(frame_dummy_positions)
+        dummy_masks.append(frame_dummy_mask)
         frame_lens_shapes = lens_shapes
         if effect.add_moving_shape:
             shape_x, shape_y = moving_shape_path[frame_idx]
@@ -738,7 +757,7 @@ def make_target(
         )
         frames.append(frame)
 
-    return frames, positions
+    return frames, positions, np.stack(dummy_positions, axis=0), np.stack(dummy_masks, axis=0)
 
 
 def play_image_list(
@@ -782,5 +801,5 @@ if __name__ == "__main__":
     image, image_path = make_nothing()
     print(f"Selected image: {image_path}")
 
-    frames, positions = make_target(n_frames=300, texture=image)
+    frames, positions, _dummy_positions, _dummy_mask = make_target(n_frames=300, texture=image)
     play_image_list(frames)

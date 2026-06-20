@@ -18,7 +18,7 @@ def _image_to_tensor(image: Any) -> Tensor:
 
 
 def _make_sample(texture: Any, *, n_frames: int, output_size: int) -> dict[str, Tensor]:
-    frames, positions = make_target(
+    frames, positions, dummy_positions, dummy_mask = make_target(
         n_frames=n_frames,
         texture=texture,
         out_w=output_size,
@@ -26,7 +26,14 @@ def _make_sample(texture: Any, *, n_frames: int, output_size: int) -> dict[str, 
     )
     frame_tensor = torch.stack([_image_to_tensor(frame) for frame in frames])
     position_tensor = torch.from_numpy(positions).to(torch.float32)
-    return {"frames": frame_tensor, "positions": position_tensor}
+    dummy_position_tensor = torch.from_numpy(dummy_positions).to(torch.float32)
+    dummy_mask_tensor = torch.from_numpy(dummy_mask).to(torch.bool)
+    return {
+        "frames": frame_tensor,
+        "positions": position_tensor,
+        "dummy_positions": dummy_position_tensor,
+        "dummy_mask": dummy_mask_tensor,
+    }
 
 
 class TextureDataset(IterableDataset[dict[str, Tensor]]):

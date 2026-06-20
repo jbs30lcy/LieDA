@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 from pathlib import Path
+import time
 import uuid
 from typing import Any
 
@@ -20,13 +21,8 @@ except ImportError:
     def tqdm(iterable, **_kwargs):
         return iterable
 
-from alchemy import *
+from models import TinyNet, PartialHeatUNet, TrackerOutput, apply_distance_bias, decode_centers
 from my_dataloader import my_dataloader
-
-@dataclass(frozen=True)
-class TrackerOutput:
-    heatmap: Tensor
-    offset: Tensor
 
 
 @dataclass(frozen=True)
@@ -36,215 +32,9 @@ class LossOutput:
     offset_loss: Tensor
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.AvgPool2d(kernel_size=2),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.net(x)
-
-
-class DecodeBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, skip_channels: int = 0) -> None:
-        super().__init__()
-        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
-        self.conv = nn.Sequential(
-            nn.Conv2d(out_channels + skip_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: Tensor, skip: Tensor | None = None) -> Tensor:
-        x = self.up(x)
-        if skip is not None:
-            x = torch.cat((x, skip), dim=1)
-        return self.conv(x)
-
-
-class TinyLieDA(nn.Module):
-    """Small heatmap + offset tracker for 416x416 temporal crops."""
-
-    def __init__(
-        self,
-        in_channels: int = 9,
-        channels: tuple[int, ...] = (32, 64, 128, 192, 256),
-        heatmap_channels: int = 1,
-        offset_channels: int = 2,
-    ) -> None:
-        super().__init__()
-        if len(channels) != 5:
-            raise ValueError("channels must contain 5 stages so 416x416 becomes 13x13.")
-
-        blocks: list[nn.Module] = []
-        prev_channels = in_channels
-        for next_channels in channels:
-            blocks.append(ConvBlock(prev_channels, next_channels))
-            prev_channels = next_channels
-
-        self.encoder = nn.Sequential(*blocks)
-        self.heatmap_head = nn.Conv2d(prev_channels, heatmap_channels, kernel_size=1)
-        self.offset_head = nn.Conv2d(prev_channels, offset_channels, kernel_size=1)
-
-    def forward(self, x: Tensor) -> TrackerOutput:
-        features = self.encoder(x)
-        return TrackerOutput(
-            heatmap=self.heatmap_head(features),
-            offset=self.offset_head(features),
-        )
-
-
-class SkipLieDA(nn.Module):
-    """U-Net style heatmap-only tracker for 416x416 temporal crops."""
-
-    def __init__(
-        self,
-        in_channels: int = 9,
-        channels: tuple[int, ...] = (32, 64, 128, 192, 256),
-        heatmap_channels: int = 1,
-    ) -> None:
-        super().__init__()
-        if len(channels) != 5:
-            raise ValueError("channels must contain 5 stages so 416x416 becomes 13x13.")
-
-        encoder_blocks: list[nn.Module] = []
-        prev_channels = in_channels
-        for next_channels in channels:
-            encoder_blocks.append(ConvBlock(prev_channels, next_channels))
-            prev_channels = next_channels
-        self.encoder = nn.ModuleList(encoder_blocks)
-
-        c1, c2, c3, c4, c5 = channels
-        self.decoder = nn.ModuleList(
-            [
-                DecodeBlock(c5, c4, skip_channels=c4),
-                DecodeBlock(c4, c3, skip_channels=c3),
-                DecodeBlock(c3, c2, skip_channels=c2),
-                DecodeBlock(c2, c1, skip_channels=c1),
-                DecodeBlock(c1, c1),
-            ]
-        )
-        self.heatmap_head = nn.Conv2d(c1, heatmap_channels, kernel_size=1)
-
-    def forward(self, x: Tensor) -> Tensor:
-        skips: list[Tensor] = []
-        features = x
-        for block in self.encoder:
-            features = block(features)
-            skips.append(features)
-
-        features = self.decoder[0](features, skips[3])
-        features = self.decoder[1](features, skips[2])
-        features = self.decoder[2](features, skips[1])
-        features = self.decoder[3](features, skips[0])
-        features = self.decoder[4](features)
-        return self.heatmap_head(features)
-
-
-def make_distance_squared_map(
-    height: int,
-    width: int,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-    center: tuple[float, float] | None = None,
-    normalize: bool = True,
-) -> Tensor:
-    """Returns a (1, 1, H, W) squared-distance map in grid coordinates."""
-    if center is None:
-        center_x = (width - 1) * 0.5
-        center_y = (height - 1) * 0.5
-    else:
-        center_x, center_y = center
-
-    ys = torch.arange(height, device=device, dtype=dtype).view(height, 1)
-    xs = torch.arange(width, device=device, dtype=dtype).view(1, width)
-    distance2 = (xs - center_x).square() + (ys - center_y).square()
-
-    if normalize:
-        max_distance2 = distance2.max().clamp_min(torch.finfo(dtype).eps)
-        distance2 = distance2 / max_distance2
-
-    return distance2.view(1, 1, height, width)
-
-
-def apply_distance_bias(
-    heatmap: Tensor,
-    *,
-    gamma: float,
-    enabled: bool = False,
-    center: tuple[float, float] | None = None,
-    normalize: bool = True,
-) -> Tensor:
-    """Optionally scores cells with heatmap + gamma * distance^2 before argmax."""
-    if not enabled:
-        return heatmap
-
-    _, _, height, width = heatmap.shape
-    distance2 = make_distance_squared_map(
-        height,
-        width,
-        device=heatmap.device,
-        dtype=heatmap.dtype,
-        center=center,
-        normalize=normalize,
-    )
-    return heatmap + gamma * distance2
-
-
-@torch.no_grad()
-def decode_centers(
-    output: TrackerOutput | Tensor,
-    *,
-    input_size: int = 416,
-    use_distance_bias: bool = False,
-    gamma: float = 0.0,
-    distance_center: tuple[float, float] | None = None,
-    normalize_distance: bool = True,
-) -> Tensor:
-    """Decodes coarse argmax + local offset into crop-local pixel centers.
-
-    If offset is present, it is interpreted in output-grid cell units. The
-    returned tensor is shaped (B, 2) and ordered as (x, y) in the input crop
-    coordinate system.
-    """
-    heatmap = output.heatmap if isinstance(output, TrackerOutput) else output
-    offset = output.offset if isinstance(output, TrackerOutput) else None
-    batch_size, _, height, width = heatmap.shape
-    stride = input_size / float(width)
-
-    scores = apply_distance_bias(
-        heatmap,
-        gamma=gamma,
-        enabled=use_distance_bias,
-        center=distance_center,
-        normalize=normalize_distance,
-    )
-    flat_indices = scores.flatten(start_dim=2).argmax(dim=2).squeeze(1)
-    ys = torch.div(flat_indices, width, rounding_mode="floor")
-    xs = flat_indices.remainder(width)
-
-    if offset is None:
-        dx = torch.zeros(batch_size, device=heatmap.device, dtype=heatmap.dtype)
-        dy = torch.zeros(batch_size, device=heatmap.device, dtype=heatmap.dtype)
-        center_dtype = heatmap.dtype
-    else:
-        batch_indices = torch.arange(batch_size, device=heatmap.device)
-        dx = offset[batch_indices, 0, ys, xs]
-        dy = offset[batch_indices, 1, ys, xs]
-        center_dtype = offset.dtype
-
-    centers_x = (xs.to(center_dtype) + 0.5 + dx) * stride
-    centers_y = (ys.to(center_dtype) + 0.5 + dy) * stride
-    return torch.stack((centers_x, centers_y), dim=1)
+def _sync_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def _batch_inputs(batch: Any) -> Tensor:
@@ -252,7 +42,7 @@ def _batch_inputs(batch: Any) -> Tensor:
         for key in ("frames", "inputs", "x", "image", "images"):
             if key in batch:
                 return batch[key]
-        raise KeyError("Batch dict must contain one of: inputs, x, image, images.")
+        raise KeyError("Batch dict must contain one of: frames, inputs, x, image, images.")
 
     if isinstance(batch, (tuple, list)):
         return batch[0]
@@ -273,6 +63,36 @@ def _batch_positions(batch: Any) -> Tensor:
         return batch[1]
 
     raise KeyError("Batch must include positions for semistep crop centers.")
+
+
+def _batch_dummy_positions(batch: Any) -> Tensor:
+    if isinstance(batch, dict):
+        for key in ("dummy_positions", "object_positions", "objects", "object_centers"):
+            if key in batch:
+                return batch[key]
+        raise KeyError(
+            "Batch dict must contain dummy_positions/object_positions for dummy object heatmap training."
+        )
+
+    if isinstance(batch, (tuple, list)) and len(batch) >= 3:
+        return batch[2]
+
+    raise KeyError("Batch must include dummy object positions.")
+
+
+def _batch_dummy_mask(batch: Any) -> Tensor:
+    if isinstance(batch, dict):
+        for key in ("dummy_mask", "object_mask", "objects_mask", "object_valid"):
+            if key in batch:
+                return batch[key]
+        raise KeyError(
+            "Batch dict must contain dummy_mask/object_mask for dummy object heatmap training."
+        )
+
+    if isinstance(batch, (tuple, list)) and len(batch) >= 4:
+        return batch[3]
+
+    raise KeyError("Batch must include a dummy object mask.")
 
 
 def _image_to_temporal_tensor(image: Any, *, frames: int = 3) -> Tensor:
@@ -303,38 +123,119 @@ def crop_around_centers(images: Tensor, centers: Tensor, crop_size: int = 416) -
     return torch.stack(crops)
 
 
+def crop_center(images: Tensor, crop_size: int = 576) -> Tensor:
+    if images.ndim != 4:
+        raise ValueError("images must have shape (B, C, H, W).")
+
+    _batch_size, _channels, height, width = images.shape
+    if crop_size > height or crop_size > width:
+        raise ValueError(
+            f"crop_size must fit within images, got crop_size={crop_size}, image={(height, width)}."
+        )
+    top = (height - crop_size) // 2
+    left = (width - crop_size) // 2
+    return images[:, :, top : top + crop_size, left : left + crop_size]
+
+
 def make_semistep_inputs(
     frames: Tensor,
     positions: Tensor,
     semistep: int,
     *,
-    crop_size: int = 416,
+    crop_size: int = 576,
 ) -> Tensor:
     if frames.ndim != 5:
         raise ValueError("frames must have shape (B, T, C, H, W).")
+    if frames.shape[2] != 3:
+        raise ValueError(f"frames must have RGB channels, got {frames.shape[2]}.")
     if positions.ndim != 3 or positions.shape[-1] != 2:
         raise ValueError("positions must have shape (B, T, 2).")
-    if not 0 <= semistep < frames.shape[1] - 2:
-        raise ValueError("semistep must be in [0, T - 3].")
+    if not 0 <= semistep < frames.shape[1] - 4:
+        raise ValueError("semistep must be in [0, T - 5].")
 
-    target_frame_idx = semistep + 2
-    window = frames[:, target_frame_idx - 2 : target_frame_idx + 1]
-    batch_size, _time, channels, height, width = window.shape
-    stacked = window.reshape(batch_size, 3 * channels, height, width)
-    crop_centers = positions[:, target_frame_idx - 1]
-    return crop_around_centers(stacked, crop_centers, crop_size=crop_size)
+    target_frame_idx = semistep + 4
+    rgb = frames[:, target_frame_idx]
+    grayscale = (
+        0.299 * frames[:, :, 0]
+        + 0.587 * frames[:, :, 1]
+        + 0.114 * frames[:, :, 2]
+    )
+    differences = [
+        grayscale[:, target_frame_idx - k] - grayscale[:, target_frame_idx - k - 1]
+        for k in range(4)
+    ]
+    stacked = torch.cat([rgb, *(diff.unsqueeze(1) for diff in differences)], dim=1)
+    return crop_center(stacked, crop_size=crop_size)
 
 
 def make_semistep_targets(
     positions: Tensor,
     semistep: int,
     *,
-    crop_size: int = 416,
+    crop_size: int = 576,
+    image_size: int = 600,
 ) -> Tensor:
-    target_frame_idx = semistep + 2
-    crop_centers = positions[:, target_frame_idx - 1]
+    target_frame_idx = semistep + 4
     target_centers = positions[:, target_frame_idx]
-    return target_centers - crop_centers + crop_size * 0.5
+    crop_offset = (image_size - crop_size) * 0.5
+    return target_centers - crop_offset
+
+
+def make_semistep_dummy_targets(
+    dummy_positions: Tensor,
+    dummy_mask: Tensor,
+    semistep: int,
+    *,
+    crop_size: int = 576,
+    image_size: int = 600,
+) -> tuple[Tensor, Tensor]:
+    target_frame_idx = semistep + 4
+    crop_offset = (image_size - crop_size) * 0.5
+    return (
+        dummy_positions[:, target_frame_idx] - crop_offset,
+        dummy_mask[:, target_frame_idx].to(torch.bool),
+    )
+
+
+def make_multi_center_heatmap_targets(
+    centers: Tensor,
+    mask: Tensor,
+    *,
+    input_size: int,
+    output_height: int,
+    output_width: int,
+    sigma: float = 1.0,
+) -> Tensor:
+    if centers.ndim != 3 or centers.shape[-1] != 2:
+        raise ValueError("centers must have shape (B, K, 2).")
+    if mask.shape != centers.shape[:2]:
+        raise ValueError("mask must have shape (B, K).")
+
+    batch_size, object_count, _ = centers.shape
+    device = centers.device
+    dtype = centers.dtype
+    stride_x = input_size / float(output_width)
+    stride_y = input_size / float(output_height)
+
+    grid_x = centers[..., 0] / stride_x
+    grid_y = centers[..., 1] / stride_y
+    valid = (
+        mask.to(torch.bool)
+        & (centers[..., 0] >= 0)
+        & (centers[..., 0] < input_size)
+        & (centers[..., 1] >= 0)
+        & (centers[..., 1] < input_size)
+    )
+
+    cell_x = torch.floor(grid_x).long().clamp(0, output_width - 1)
+    cell_y = torch.floor(grid_y).long().clamp(0, output_height - 1)
+    ys = torch.arange(output_height, device=device, dtype=dtype).view(1, 1, output_height, 1)
+    xs = torch.arange(output_width, device=device, dtype=dtype).view(1, 1, 1, output_width)
+    distance2 = (xs - cell_x.to(dtype).view(batch_size, object_count, 1, 1)).square()
+    distance2 = distance2 + (ys - cell_y.to(dtype).view(batch_size, object_count, 1, 1)).square()
+    heatmaps = torch.exp(-distance2 / (2.0 * sigma * sigma))
+    heatmaps = heatmaps * valid.to(dtype).view(batch_size, object_count, 1, 1)
+    return heatmaps.max(dim=1).values.unsqueeze(1)
 
 
 def make_heatmap_and_offset_targets(
@@ -381,11 +282,16 @@ def compute_tracking_loss(
     crop_size: int,
     heatmap_loss_fn: nn.Module,
     offset_loss_fn: nn.Module,
-    heatmap_sigma: float = 1.0,
+    heatmap_sigma: float = 4.0,
     offset_loss_weight: float = 1.0,
     use_distance_bias: bool = False,
     gamma: float = 0.0,
+    heatmap_mode: str = "target",
+    dummy_centers: Tensor | None = None,
+    dummy_mask: Tensor | None = None,
 ) -> LossOutput:
+    if heatmap_mode not in {"target", "all"}:
+        raise ValueError(f"heatmap_mode must be 'target' or 'all', got {heatmap_mode!r}.")
     heatmap = output.heatmap if isinstance(output, TrackerOutput) else output
     biased_heatmap = apply_distance_bias(
         heatmap,
@@ -399,6 +305,27 @@ def compute_tracking_loss(
         output_width=heatmap.shape[-1],
         sigma=heatmap_sigma,
     )
+    if heatmap_mode == "all":
+        if dummy_centers is None or dummy_mask is None:
+            raise ValueError(
+                "dummy_centers and dummy_mask are required when heatmap_mode='all'."
+            )
+        all_centers = torch.cat((target_centers.unsqueeze(1), dummy_centers), dim=1)
+        target_mask = torch.ones(
+            target_centers.shape[0],
+            1,
+            device=target_centers.device,
+            dtype=torch.bool,
+        )
+        all_mask = torch.cat((target_mask, dummy_mask.to(torch.bool)), dim=1)
+        target_heatmap = make_multi_center_heatmap_targets(
+            all_centers,
+            all_mask,
+            input_size=crop_size,
+            output_height=heatmap.shape[-2],
+            output_width=heatmap.shape[-1],
+            sigma=heatmap_sigma,
+        )
     heatmap_loss = heatmap_loss_fn(biased_heatmap, target_heatmap)
     if isinstance(output, TrackerOutput):
         offset_difference = output.offset - target_offset
@@ -410,6 +337,7 @@ def compute_tracking_loss(
     else:
         offset_loss = heatmap_loss.new_zeros(())
         loss = heatmap_loss
+
     return LossOutput(
         loss=loss,
         heatmap_loss=heatmap_loss,
@@ -545,6 +473,7 @@ def _draw_centers_video(
     path: str | Path,
     *,
     fps: int = 30,
+    start_frame: int = 2,
 ) -> None:
     frames_uint8 = _frames_to_uint8_hwc(frames)
     height, width = frames_uint8.shape[1:3]
@@ -561,8 +490,10 @@ def _draw_centers_video(
     predictions = predicted_centers.detach().cpu().numpy()
     for frame_idx, frame_rgb in enumerate(frames_uint8):
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        if frame_idx >= 2:
-            center_idx = frame_idx - 2
+        if frame_idx >= start_frame:
+            center_idx = frame_idx - start_frame
+            if center_idx >= len(labels):
+                continue
             lx, ly = labels[center_idx]
             px, py = predictions[center_idx]
             cv2.circle(frame_bgr, (round(lx), round(ly)), 7, (0, 255, 0), 2, lineType=cv2.LINE_AA)
@@ -586,17 +517,25 @@ def eval(
     frames: Tensor,
     positions: Tensor,
     *,
+    dummy_positions: Tensor | None = None,
+    dummy_mask: Tensor | None = None,
     output_dir: str | Path,
     name: str = "eval",
     device: torch.device | str | None = None,
-    crop_size: int = 416,
-    heatmap_sigma: float = 1.0,
+    crop_size: int = 576,
+    heatmap_sigma: float = 4.0,
     offset_loss_weight: float = 1.0,
     use_distance_bias: bool = False,
     gamma: float = 0.0,
     hit_radius: float = 55.2,
     fps: int = 30,
+    train_elapsed_seconds: float | None = None,
+    step_train_seconds: float | None = None,
+    heatmap_mode: str = "target",
 ) -> dict[str, Any]:
+    if heatmap_mode not in {"target", "all"}:
+        raise ValueError(f"heatmap_mode must be 'target' or 'all', got {heatmap_mode!r}.")
+    eval_start_time = time.perf_counter()
     if device is None:
         device = next(model.parameters()).device
     else:
@@ -624,16 +563,25 @@ def eval(
     model.eval()
     frames_batch = frames.unsqueeze(0).to(device)
     positions_batch = positions.unsqueeze(0).to(device, dtype=frames_batch.dtype)
+    if heatmap_mode == "all":
+        if dummy_positions is None or dummy_mask is None:
+            raise ValueError(
+                "dummy_positions and dummy_mask are required when heatmap_mode='all'."
+            )
+        dummy_positions_batch = dummy_positions.unsqueeze(0).to(device, dtype=frames_batch.dtype)
+        dummy_mask_batch = dummy_mask.unsqueeze(0).to(device)
+    else:
+        dummy_positions_batch = None
+        dummy_mask_batch = None
     heatmap_loss_fn = nn.BCEWithLogitsLoss()
     offset_loss_fn = nn.SmoothL1Loss(reduction="sum")
-
     predicted_centers: list[Tensor] = []
     label_centers: list[Tensor] = []
     losses: list[float] = []
     heatmap_losses: list[float] = []
     offset_losses: list[float] = []
 
-    for semistep in range(frames_batch.shape[1] - 2):
+    for semistep in range(frames_batch.shape[1] - 4):
         inputs = make_semistep_inputs(
             frames_batch,
             positions_batch,
@@ -645,6 +593,18 @@ def eval(
             semistep,
             crop_size=crop_size,
         )
+        if heatmap_mode == "all":
+            assert dummy_positions_batch is not None
+            assert dummy_mask_batch is not None
+            dummy_centers, semistep_dummy_mask = make_semistep_dummy_targets(
+                dummy_positions_batch,
+                dummy_mask_batch,
+                semistep,
+                crop_size=crop_size,
+            )
+        else:
+            dummy_centers = None
+            semistep_dummy_mask = None
         output = model(inputs)
         loss_output = compute_tracking_loss(
             output,
@@ -656,6 +616,9 @@ def eval(
             offset_loss_weight=offset_loss_weight,
             use_distance_bias=use_distance_bias,
             gamma=gamma,
+            heatmap_mode=heatmap_mode,
+            dummy_centers=dummy_centers,
+            dummy_mask=semistep_dummy_mask,
         )
         predicted_local = decode_centers(
             output,
@@ -663,9 +626,9 @@ def eval(
             use_distance_bias=use_distance_bias,
             gamma=gamma,
         )
-        crop_centers = positions_batch[:, semistep + 1]
-        predicted_global = predicted_local + crop_centers - crop_size * 0.5
-        label_global = positions_batch[:, semistep + 2]
+        crop_offset = (frames_batch.shape[-1] - crop_size) * 0.5
+        predicted_global = predicted_local + crop_offset
+        label_global = positions_batch[:, semistep + 4]
 
         predicted_centers.append(predicted_global.squeeze(0).detach().cpu())
         label_centers.append(label_global.squeeze(0).detach().cpu())
@@ -682,6 +645,7 @@ def eval(
         "num_predictions": int(predicted_tensor.shape[0]),
         "accuracy": float(hits.float().mean().item()),
         "hit_radius": float(hit_radius),
+        "heatmap_mode": heatmap_mode,
         "loss": float(np.mean(losses)),
         "heatmap_loss": float(np.mean(heatmap_losses)),
         "offset_loss": float(np.mean(offset_losses)),
@@ -700,7 +664,14 @@ def eval(
         predicted_tensor,
         video_path,
         fps=fps,
+        start_frame=4,
     )
+    _sync_device(device)
+    metrics["eval_time_seconds"] = float(time.perf_counter() - eval_start_time)
+    if train_elapsed_seconds is not None:
+        metrics["train_elapsed_seconds"] = float(train_elapsed_seconds)
+    if step_train_seconds is not None:
+        metrics["step_train_seconds"] = float(step_train_seconds)
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     if was_training:
@@ -718,17 +689,20 @@ def train(
     steps: int = 100,
     batch: int = 16,
     lr: float = 1e-3,
-    crop_size: int = 416,
+    crop_size: int = 576,
     eval_step: int = 20,
     save_step: int = 20,
     run_root: str | Path = "runs",
-    heatmap_sigma: float = 1.0,
+    heatmap_sigma: float = 4.0,
     offset_loss_weight: float = 1.0,
     wandb_active: bool = False,
     wandb_project: str = "LieDA",
     use_distance_bias: bool = False,
     gamma: float = 0.0,
+    heatmap_mode: str = "target",
 ) -> Path:
+    if heatmap_mode not in {"target", "all"}:
+        raise ValueError(f"heatmap_mode must be 'target' or 'all', got {heatmap_mode!r}.")
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
@@ -784,6 +758,7 @@ def train(
                 "offset_loss_weight": offset_loss_weight,
                 "use_distance_bias": use_distance_bias,
                 "gamma": gamma,
+                "heatmap_mode": heatmap_mode,
             },
         )
 
@@ -797,6 +772,7 @@ def train(
         "offset_loss_weight": offset_loss_weight,
         "use_distance_bias": use_distance_bias,
         "gamma": gamma,
+        "heatmap_mode": heatmap_mode,
         "params": None if params is None else str(params),
         "loaded_step": None if loaded_checkpoint is None else loaded_checkpoint.get("step", 0),
     }
@@ -805,10 +781,22 @@ def train(
     best_step_loss = float("inf")
     steps_without_improvement = 0
     early_stop_patience = 5
+    train_start_time = time.perf_counter()
     for step in progress:
+        step_start_time = time.perf_counter()
         batch_data = next(data_iter)
         frames = _batch_inputs(batch_data).to(device, non_blocking=True)
         positions = _batch_positions(batch_data).to(device, dtype=frames.dtype, non_blocking=True)
+        if heatmap_mode == "all":
+            dummy_positions = _batch_dummy_positions(batch_data).to(
+                device,
+                dtype=frames.dtype,
+                non_blocking=True,
+            )
+            dummy_mask = _batch_dummy_mask(batch_data).to(device, non_blocking=True)
+        else:
+            dummy_positions = None
+            dummy_mask = None
 
         if frames.ndim != 5 or frames.shape[1:] != (300, 3, 600, 600):
             raise ValueError(
@@ -819,7 +807,8 @@ def train(
         step_losses: list[float] = []
         step_heatmap_losses: list[float] = []
         step_offset_losses: list[float] = []
-        for semistep in range(frames.shape[1] - 2):
+        semistep_count = frames.shape[1] - 4
+        for semistep in range(semistep_count):
             inputs = make_semistep_inputs(
                 frames,
                 positions,
@@ -831,6 +820,18 @@ def train(
                 semistep,
                 crop_size=crop_size,
             )
+            if heatmap_mode == "all":
+                assert dummy_positions is not None
+                assert dummy_mask is not None
+                dummy_centers, semistep_dummy_mask = make_semistep_dummy_targets(
+                    dummy_positions,
+                    dummy_mask,
+                    semistep,
+                    crop_size=crop_size,
+                )
+            else:
+                dummy_centers = None
+                semistep_dummy_mask = None
 
             optimizer.zero_grad(set_to_none=True)
             output = model(inputs)
@@ -844,12 +845,15 @@ def train(
                 offset_loss_weight=offset_loss_weight,
                 use_distance_bias=use_distance_bias,
                 gamma=gamma,
+                heatmap_mode=heatmap_mode,
+                dummy_centers=dummy_centers,
+                dummy_mask=semistep_dummy_mask,
             )
 
             loss_output.loss.backward()
             optimizer.step()
 
-            global_semistep = step * (frames.shape[1] - 2) + semistep
+            global_semistep = step * semistep_count + semistep
             metrics = {
                 "loss": float(loss_output.loss.detach().cpu()),
                 "heatmap_loss": float(loss_output.heatmap_loss.detach().cpu()),
@@ -876,14 +880,20 @@ def train(
             "step_offset_loss": float(np.mean(step_offset_losses)),
             "step": step + 1,
         }
+        _sync_device(device)
+        step_train_seconds = float(time.perf_counter() - step_start_time)
+        train_elapsed_seconds = float(time.perf_counter() - train_start_time)
+        step_metrics["step_train_seconds"] = step_train_seconds
+        step_metrics["train_elapsed_seconds"] = train_elapsed_seconds
         print(
             f"step {step + 1}/{steps} "
             f"loss={step_metrics['step_loss']:.6f} "
             f"heatmap={step_metrics['step_heatmap_loss']:.6f} "
-            f"offset={step_metrics['step_offset_loss']:.6f}"
+            f"offset={step_metrics['step_offset_loss']:.6f} "
+            f"time={step_train_seconds:.2f}s"
         )
         if wandb_run is not None:
-            wandb_run.log(step_metrics, step=(step + 1) * (frames.shape[1] - 2))
+            wandb_run.log(step_metrics, step=(step + 1) * semistep_count)
 
         completed_steps = step + 1
         if step_metrics["step_loss"] < best_step_loss:
@@ -920,6 +930,8 @@ def train(
                 model,
                 frames[0].detach().cpu(),
                 positions[0].detach().cpu(),
+                dummy_positions=None if dummy_positions is None else dummy_positions[0].detach().cpu(),
+                dummy_mask=None if dummy_mask is None else dummy_mask[0].detach().cpu(),
                 output_dir=run_dir / "eval",
                 name=f"step_{step + 1:06d}",
                 device=device,
@@ -928,6 +940,9 @@ def train(
                 offset_loss_weight=offset_loss_weight,
                 use_distance_bias=use_distance_bias,
                 gamma=gamma,
+                train_elapsed_seconds=train_elapsed_seconds,
+                step_train_seconds=step_train_seconds,
+                heatmap_mode=heatmap_mode,
             )
             print(
                 f"eval step {step + 1}: "
@@ -943,8 +958,11 @@ def train(
                         "eval/heatmap_loss": eval_metrics["heatmap_loss"],
                         "eval/offset_loss": eval_metrics["offset_loss"],
                         "eval/standard_distance": eval_metrics["standard_distance"],
+                        "eval/eval_time_seconds": eval_metrics["eval_time_seconds"],
+                        "eval/train_elapsed_seconds": eval_metrics["train_elapsed_seconds"],
+                        "eval/step_train_seconds": eval_metrics["step_train_seconds"],
                     },
-                    step=(step + 1) * (frames.shape[1] - 2),
+                    step=(step + 1) * semistep_count,
                 )
 
     if wandb_run is not None:
@@ -963,7 +981,29 @@ def train(
     return run_dir
 
 
-if __name__ == '__main__':
-    model = TinyLieDA()
-    train(model, steps = 100, batch = 4, eval_step = 10, save_step = 10, use_distance_bias=True, gamma=-0.01)
-    
+if __name__ == "__main__":
+    # train(model, steps=100, batch=4, eval_step=10, save_step=10, use_distance_bias=True, gamma=-0.01)
+
+    model1 = TinyNet(in_channels=7)
+    train(
+        model1,
+        steps=1,
+        batch=1,
+        eval_step=1,
+        save_step=1,
+        heatmap_sigma=1,
+        use_distance_bias=False,
+        heatmap_mode="all",
+    )
+
+    model2 = PartialHeatUNet(in_channels=7)
+    train(
+        model2,
+        steps=1,
+        batch=1,
+        eval_step=1,
+        save_step=1,
+        heatmap_sigma=4,
+        use_distance_bias=False,
+        heatmap_mode="all",
+    )
