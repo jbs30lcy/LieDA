@@ -7,7 +7,7 @@ from torch import Tensor, nn
 
 
 @dataclass(frozen=True)
-class TrackerOutput:
+class HeatmapElement:
     heatmap: Tensor
     offset: Tensor
 
@@ -70,9 +70,9 @@ class TinyNet(nn.Module):
         self.heatmap_head = nn.Conv2d(prev_channels, heatmap_channels, kernel_size=1)
         self.offset_head = nn.Conv2d(prev_channels, offset_channels, kernel_size=1)
 
-    def forward(self, x: Tensor) -> TrackerOutput:
+    def forward(self, x: Tensor) -> HeatmapElement:
         features = self.encoder(x)
-        return TrackerOutput(
+        return HeatmapElement(
             heatmap=self.heatmap_head(features),
             offset=self.offset_head(features),
         )
@@ -152,7 +152,7 @@ class PartialHeatUNet(nn.Module):
         self.heatmap_head = nn.Conv2d(c3, heatmap_channels, kernel_size=1)
         self.offset_head = nn.Conv2d(c3, offset_channels, kernel_size=1)
 
-    def forward(self, x: Tensor) -> TrackerOutput:
+    def forward(self, x: Tensor) -> HeatmapElement:
         skips: list[Tensor] = []
         features = x
         for block in self.encoder:
@@ -161,9 +161,156 @@ class PartialHeatUNet(nn.Module):
 
         features = self.decoder[0](features, skips[3])
         features = self.decoder[1](features, skips[2])
-        return TrackerOutput(
+        return HeatmapElement(
             heatmap=self.heatmap_head(features),
             offset=self.offset_head(features),
+        )
+
+
+class ConvGRUCell(nn.Module):
+    """GRU cell that keeps spatial hidden state as (B, C, H, W)."""
+
+    def __init__(
+        self,
+        input_channels: int,
+        hidden_channels: int = 16,
+        kernel_size: int = 3,
+    ) -> None:
+        super().__init__()
+        padding = kernel_size // 2
+        gate_channels = input_channels + hidden_channels
+        self.hidden_channels = hidden_channels
+        self.update_gate = nn.Conv2d(gate_channels, hidden_channels, kernel_size, padding=padding)
+        self.reset_gate = nn.Conv2d(gate_channels, hidden_channels, kernel_size, padding=padding)
+        self.candidate = nn.Conv2d(gate_channels, hidden_channels, kernel_size, padding=padding)
+
+    def forward(self, x: Tensor, hidden: Tensor | None = None) -> Tensor:
+        if hidden is None:
+            hidden = x.new_zeros(
+                x.shape[0],
+                self.hidden_channels,
+                x.shape[-2],
+                x.shape[-1],
+            )
+        if hidden.shape[0] != x.shape[0] or hidden.shape[-2:] != x.shape[-2:]:
+            raise ValueError(
+                "hidden must have the same batch size and spatial shape as x, "
+                f"got hidden={tuple(hidden.shape)} x={tuple(x.shape)}."
+            )
+
+        combined = torch.cat((x, hidden), dim=1)
+        update = torch.sigmoid(self.update_gate(combined))
+        reset = torch.sigmoid(self.reset_gate(combined))
+        candidate = torch.tanh(self.candidate(torch.cat((x, reset * hidden), dim=1)))
+        return (1.0 - update) * hidden + update * candidate
+
+
+class LieDA(nn.Module):
+    """Heatmap model followed by a ConvGRU target selector."""
+
+    def __init__(
+        self,
+        heatmap_model: nn.Module,
+        *,
+        gru_hidden_channels: int = 16,
+        gru_kernel_size: int = 3,
+        gru_layers: int = 1,
+        heatmap_freeze: bool = False,
+        GRU_freeze: bool = False,
+    ) -> None:
+        super().__init__()
+        if gru_layers < 1:
+            raise ValueError("gru_layers must be at least 1.")
+        self.heatmap_model = heatmap_model
+        self.gru = nn.ModuleList(
+            [
+                ConvGRUCell(
+                    input_channels=3 if layer_idx == 0 else gru_hidden_channels,
+                    hidden_channels=gru_hidden_channels,
+                    kernel_size=gru_kernel_size,
+                )
+                for layer_idx in range(gru_layers)
+            ]
+        )
+        self.output_head = nn.Conv2d(gru_hidden_channels, 3, kernel_size=1)
+        self.set_heatmap_freeze(heatmap_freeze)
+        self.set_GRU_freeze(GRU_freeze)
+
+    def set_heatmap_freeze(self, freeze: bool = True) -> None:
+        for parameter in self.heatmap_model.parameters():
+            parameter.requires_grad_(not freeze)
+
+    def set_GRU_freeze(self, freeze: bool = True) -> None:
+        for module in (self.gru, self.output_head):
+            for parameter in module.parameters():
+                parameter.requires_grad_(not freeze)
+
+    def heatmap_parameters(self):
+        return self.heatmap_model.parameters()
+
+    def GRU_parameters(self):
+        for parameter in self.gru.parameters():
+            yield parameter
+        yield from self.output_head.parameters()
+
+    def load_heatmap_state_dict(self, state_dict: dict[str, Tensor], *, strict: bool = True):
+        heatmap_prefix = "heatmap_model."
+        if any(key.startswith(heatmap_prefix) for key in state_dict):
+            state_dict = {
+                key[len(heatmap_prefix) :]: value
+                for key, value in state_dict.items()
+                if key.startswith(heatmap_prefix)
+            }
+        return self.heatmap_model.load_state_dict(state_dict, strict=strict)
+
+    def forward_step(
+        self,
+        x: Tensor,
+        hidden: list[Tensor] | None = None,
+    ) -> tuple[HeatmapElement, list[Tensor], HeatmapElement]:
+        heatmap_trainable = any(parameter.requires_grad for parameter in self.heatmap_model.parameters())
+        if heatmap_trainable:
+            all_output = self.heatmap_model(x)
+        else:
+            with torch.no_grad():
+                all_output = self.heatmap_model(x)
+        if not isinstance(all_output, HeatmapElement):
+            raise TypeError("LieDA heatmap_model must return HeatmapElement.")
+
+        gru_input = torch.cat((all_output.heatmap, all_output.offset), dim=1)
+        if hidden is None:
+            hidden = [None] * len(self.gru)
+        if len(hidden) != len(self.gru):
+            raise ValueError(f"hidden must contain {len(self.gru)} tensors.")
+
+        features = gru_input
+        next_hidden: list[Tensor] = []
+        for layer, layer_hidden in zip(self.gru, hidden):
+            features = layer(features, layer_hidden)
+            next_hidden.append(features)
+
+        target_output = self.output_head(features)
+        return (
+            HeatmapElement(heatmap=target_output[:, :1], offset=target_output[:, 1:]),
+            next_hidden,
+            all_output,
+        )
+
+    def forward(self, x: Tensor, hidden: list[Tensor] | None = None):
+        if x.ndim == 4:
+            target_output, next_hidden, _all_output = self.forward_step(x, hidden)
+            return target_output if hidden is None else (target_output, next_hidden)
+        if x.ndim != 5:
+            raise ValueError("x must have shape (B, C, H, W) or (B, T, C, H, W).")
+
+        outputs: list[HeatmapElement] = []
+        next_hidden = hidden
+        for frame_idx in range(x.shape[1]):
+            output, next_hidden, _all_output = self.forward_step(x[:, frame_idx], next_hidden)
+            outputs.append(output)
+        return HeatmapElement(
+            heatmap=torch.stack([output.heatmap for output in outputs], dim=1),
+            offset=torch.stack([output.offset for output in outputs], dim=1),
         )
 
 
@@ -218,7 +365,7 @@ def apply_distance_bias(
 
 @torch.no_grad()
 def decode_centers(
-    output: TrackerOutput | Tensor,
+    output: HeatmapElement | Tensor,
     *,
     input_size: int = 416,
     use_distance_bias: bool = False,
@@ -226,8 +373,8 @@ def decode_centers(
     distance_center: tuple[float, float] | None = None,
     normalize_distance: bool = True,
 ) -> Tensor:
-    heatmap = output.heatmap if isinstance(output, TrackerOutput) else output
-    offset = output.offset if isinstance(output, TrackerOutput) else None
+    heatmap = output.heatmap if isinstance(output, HeatmapElement) else output
+    offset = output.offset if isinstance(output, HeatmapElement) else None
     batch_size, _, height, width = heatmap.shape
     stride = input_size / float(width)
 
