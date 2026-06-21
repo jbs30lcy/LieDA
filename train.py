@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 from pathlib import Path
+import re
 import time
 import uuid
 from typing import Any
@@ -390,9 +391,18 @@ def compute_tracking_loss(
     )
 
 
-def make_run_dir(root: str | Path = "runs") -> Path:
+def _experiment_suffix(experiment_name: str | None = None) -> str:
+    if experiment_name is None or not experiment_name.strip():
+        return uuid.uuid4().hex[:8]
+
+    suffix = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", experiment_name.strip())
+    suffix = suffix.strip(" ._")
+    return suffix or uuid.uuid4().hex[:8]
+
+
+def make_run_dir(root: str | Path = "runs", *, experiment_name: str | None = None) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(root) / f"{timestamp}_{uuid.uuid4().hex[:8]}"
+    run_dir = Path(root) / f"{timestamp}_{_experiment_suffix(experiment_name)}"
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / "eval").mkdir()
     (run_dir / "checkpoints").mkdir()
@@ -636,6 +646,7 @@ def eval(
     train_elapsed_seconds: float | None = None,
     step_train_seconds: float | None = None,
     heatmap_mode: str = "target",
+    experiment_name: str | None = None,
 ) -> dict[str, Any]:
     if heatmap_mode not in {"target", "all"}:
         raise ValueError(f"heatmap_mode must be 'target' or 'all', got {heatmap_mode!r}.")
@@ -793,6 +804,8 @@ def eval(
     hits = distances <= hit_radius # TODO : hit 판정을 radius로 판정하는 거 고쳐야 됨
     metrics = {
         "name": name,
+        "experiment_name": experiment_name,
+        "run_dir": str(output_dir.parent),
         "num_predictions": int(predicted_tensor.shape[0]),
         "accuracy": float(hits.float().mean().item()),
         "hit_radius": float(hit_radius),
@@ -869,6 +882,7 @@ def train_heatmap(
     eval_step: int = 20,
     save_step: int = 20,
     run_root: str | Path = "runs",
+    experiment_name: str | None = None,
     heatmap_sigma: float = 4.0,
     offset_loss_weight: float = 1.0,
     center_loss_weight: float = 0.01,
@@ -911,7 +925,7 @@ def train_heatmap(
             #pin_memory=device.type == "cuda",
         )
 
-    run_dir = make_run_dir(run_root)
+    run_dir = make_run_dir(run_root, experiment_name=experiment_name)
     print(f"[train] run directory: {run_dir}")
     wandb_run = None
     if wandb_active:
@@ -931,6 +945,7 @@ def train_heatmap(
                 "eval_step": eval_step,
                 "save_step": save_step,
                 "run_dir": str(run_dir),
+                "experiment_name": experiment_name,
                 "params": None if params is None else str(params),
                 "loaded_step": None if loaded_checkpoint is None else loaded_checkpoint.get("step", 0),
                 "heatmap_sigma": heatmap_sigma,
@@ -949,6 +964,7 @@ def train_heatmap(
         "batch": batch,
         "lr": lr,
         "crop_size": crop_size,
+        "experiment_name": experiment_name,
         "heatmap_sigma": heatmap_sigma,
         "offset_loss_weight": offset_loss_weight,
         "center_loss_weight": center_loss_weight,
@@ -1137,6 +1153,7 @@ def train_heatmap(
                 train_elapsed_seconds=train_elapsed_seconds,
                 step_train_seconds=step_train_seconds,
                 heatmap_mode=heatmap_mode,
+                experiment_name=experiment_name,
             )
             print(
                 f"eval step {step + 1}: "
@@ -1193,6 +1210,7 @@ def train_gru(
     eval_step: int = 20,
     save_step: int = 20,
     run_root: str | Path = "runs",
+    experiment_name: str | None = None,
     heatmap_sigma: float = 4.0,
     offset_loss_weight: float = 1.0,
     center_loss_weight: float = 0.01,
@@ -1253,7 +1271,7 @@ def train_gru(
             #pin_memory=device.type == "cuda",
         )
 
-    run_dir = make_run_dir(run_root)
+    run_dir = make_run_dir(run_root, experiment_name=experiment_name)
     print(f"[train_gru] run directory: {run_dir}")
     wandb_run = None
     if wandb_active:
@@ -1274,6 +1292,7 @@ def train_gru(
                 "eval_step": eval_step,
                 "save_step": save_step,
                 "run_dir": str(run_dir),
+                "experiment_name": experiment_name,
                 "heatmap_sigma": heatmap_sigma,
                 "offset_loss_weight": offset_loss_weight,
                 "center_loss_weight": center_loss_weight,
@@ -1298,6 +1317,7 @@ def train_gru(
         "batch": batch,
         "lr": lr,
         "crop_size": crop_size,
+        "experiment_name": experiment_name,
         "eval_step": eval_step,
         "save_step": save_step,
         "heatmap_sigma": heatmap_sigma,
@@ -1512,6 +1532,7 @@ def train_gru(
                 train_elapsed_seconds=train_elapsed_seconds,
                 step_train_seconds=step_train_seconds,
                 heatmap_mode="target",
+                experiment_name=experiment_name,
             )
             print(
                 f"gru eval step {step + 1}: "
@@ -1591,6 +1612,9 @@ if __name__ == "__main__":
         "heatmap_sigma": 4,
         "use_distance_bias": False,
     }
+
+    experiment_name = input("Write experiment name or skip: ").strip() or None
+    common["experiment_name"] = experiment_name
 
     # 1. difficulty 1: train PartialUNet heatmap model only.
     train(
