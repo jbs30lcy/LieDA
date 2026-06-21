@@ -30,6 +30,7 @@ class LossOutput:
     loss: Tensor
     heatmap_loss: Tensor
     offset_loss: Tensor
+    center_loss: Tensor
 
 
 def _sync_device(device: torch.device) -> None:
@@ -275,6 +276,36 @@ def make_heatmap_and_offset_targets(
     return heatmap, offset, offset_mask
 
 
+def softargmax_centers(
+    output: HeatmapElement | Tensor,
+    *,
+    input_size: int,
+    temperature: float = 0.25,
+) -> Tensor:
+    heatmap = output.heatmap if isinstance(output, HeatmapElement) else output
+    offset = output.offset if isinstance(output, HeatmapElement) else None
+    batch_size, _, height, width = heatmap.shape
+    stride_x = input_size / float(width)
+    stride_y = input_size / float(height)
+    temperature = max(float(temperature), torch.finfo(heatmap.dtype).eps)
+
+    probs = torch.softmax(heatmap.flatten(start_dim=2) / temperature, dim=-1)
+    probs = probs.view(batch_size, 1, height, width)
+
+    ys = torch.arange(height, device=heatmap.device, dtype=heatmap.dtype).view(1, 1, height, 1)
+    xs = torch.arange(width, device=heatmap.device, dtype=heatmap.dtype).view(1, 1, 1, width)
+    if offset is None:
+        offset_x = torch.zeros_like(probs)
+        offset_y = torch.zeros_like(probs)
+    else:
+        offset_x = offset[:, 0:1]
+        offset_y = offset[:, 1:2]
+
+    centers_x = ((xs + 0.5 + offset_x) * probs).sum(dim=(2, 3)) * stride_x
+    centers_y = ((ys + 0.5 + offset_y) * probs).sum(dim=(2, 3)) * stride_y
+    return torch.cat((centers_x, centers_y), dim=1)
+
+
 def compute_tracking_loss(
     output: HeatmapElement | Tensor,
     target_centers: Tensor,
@@ -284,6 +315,8 @@ def compute_tracking_loss(
     offset_loss_fn: nn.Module,
     heatmap_sigma: float = 4.0,
     offset_loss_weight: float = 1.0,
+    center_loss_weight: float = 0.01,
+    softargmax_temperature: float = 0.25,
     use_distance_bias: bool = False,
     gamma: float = 0.0,
     heatmap_mode: str = "target",
@@ -327,21 +360,33 @@ def compute_tracking_loss(
             sigma=heatmap_sigma,
         )
     heatmap_loss = heatmap_loss_fn(biased_heatmap, target_heatmap)
+    center_loss = heatmap_loss.new_zeros(())
+    if heatmap_mode == "target" and center_loss_weight > 0:
+        center_prediction = softargmax_centers(
+            HeatmapElement(heatmap=biased_heatmap, offset=output.offset)
+            if isinstance(output, HeatmapElement)
+            else biased_heatmap,
+            input_size=crop_size,
+            temperature=softargmax_temperature,
+        )
+        center_loss = F.smooth_l1_loss(center_prediction, target_centers)
+
     if isinstance(output, HeatmapElement):
         offset_difference = output.offset - target_offset
         offset_loss = offset_loss_fn(
             offset_difference * offset_mask,
             torch.zeros_like(offset_difference),
         ) / offset_mask.sum().clamp_min(1.0)
-        loss = heatmap_loss + offset_loss_weight * offset_loss
+        loss = heatmap_loss + offset_loss_weight * offset_loss + center_loss_weight * center_loss
     else:
         offset_loss = heatmap_loss.new_zeros(())
-        loss = heatmap_loss
+        loss = heatmap_loss + center_loss_weight * center_loss
 
     return LossOutput(
         loss=loss,
         heatmap_loss=heatmap_loss,
         offset_loss=offset_loss,
+        center_loss=center_loss,
     )
 
 
@@ -582,6 +627,8 @@ def eval(
     crop_size: int = 576,
     heatmap_sigma: float = 4.0,
     offset_loss_weight: float = 1.0,
+    center_loss_weight: float = 0.01,
+    softargmax_temperature: float = 0.25,
     use_distance_bias: bool = False,
     gamma: float = 0.0,
     hit_radius: float = 55.2,
@@ -622,11 +669,11 @@ def eval(
     model.eval()
     frames_batch = frames.unsqueeze(0).to(device)
     positions_batch = positions.unsqueeze(0).to(device, dtype=frames_batch.dtype)
-    if heatmap_mode == "all":
-        if dummy_positions is None or dummy_mask is None:
-            raise ValueError(
-                "dummy_positions and dummy_mask are required when heatmap_mode='all'."
-            )
+    if heatmap_mode == "all" and (dummy_positions is None or dummy_mask is None):
+        raise ValueError(
+            "dummy_positions and dummy_mask are required when heatmap_mode='all'."
+        )
+    if dummy_positions is not None and dummy_mask is not None:
         dummy_positions_batch = dummy_positions.unsqueeze(0).to(device, dtype=frames_batch.dtype)
         dummy_mask_batch = dummy_mask.unsqueeze(0).to(device)
     else:
@@ -639,6 +686,12 @@ def eval(
     losses: list[float] = []
     heatmap_losses: list[float] = []
     offset_losses: list[float] = []
+    center_losses: list[float] = []
+    heatmap_predicted_centers: list[Tensor] = []
+    heatmap_losses_from_part: list[float] = []
+    heatmap_heatmap_losses_from_part: list[float] = []
+    heatmap_offset_losses_from_part: list[float] = []
+    heatmap_center_losses_from_part: list[float] = []
     last_predicted_heatmap: Tensor | None = None
     hidden: list[Tensor] | None = None
 
@@ -654,7 +707,7 @@ def eval(
             semistep,
             crop_size=crop_size,
         )
-        if heatmap_mode == "all":
+        if dummy_positions_batch is not None and dummy_mask_batch is not None:
             assert dummy_positions_batch is not None
             assert dummy_mask_batch is not None
             dummy_centers, semistep_dummy_mask = make_semistep_dummy_targets(
@@ -667,7 +720,36 @@ def eval(
             dummy_centers = None
             semistep_dummy_mask = None
         if isinstance(model, LieDA):
-            output, hidden, _all_output = model.forward_step(inputs, hidden)
+            output, hidden, all_output = model.forward_step(inputs, hidden)
+            heatmap_part_mode = "all" if dummy_centers is not None and semistep_dummy_mask is not None else "target"
+            heatmap_part_loss = compute_tracking_loss(
+                all_output,
+                target_centers,
+                crop_size=crop_size,
+                heatmap_loss_fn=heatmap_loss_fn,
+                offset_loss_fn=offset_loss_fn,
+                heatmap_sigma=heatmap_sigma,
+                offset_loss_weight=offset_loss_weight,
+                center_loss_weight=center_loss_weight,
+                softargmax_temperature=softargmax_temperature,
+                use_distance_bias=use_distance_bias,
+                gamma=gamma,
+                heatmap_mode=heatmap_part_mode,
+                dummy_centers=dummy_centers,
+                dummy_mask=semistep_dummy_mask,
+            )
+            heatmap_part_local = decode_centers(
+                all_output,
+                input_size=crop_size,
+                use_distance_bias=use_distance_bias,
+                gamma=gamma,
+            )
+            heatmap_part_global = heatmap_part_local + (frames_batch.shape[-1] - crop_size) * 0.5
+            heatmap_predicted_centers.append(heatmap_part_global.squeeze(0).detach().cpu())
+            heatmap_losses_from_part.append(float(heatmap_part_loss.loss.detach().cpu()))
+            heatmap_heatmap_losses_from_part.append(float(heatmap_part_loss.heatmap_loss.detach().cpu()))
+            heatmap_offset_losses_from_part.append(float(heatmap_part_loss.offset_loss.detach().cpu()))
+            heatmap_center_losses_from_part.append(float(heatmap_part_loss.center_loss.detach().cpu()))
         else:
             output = model(inputs)
         output_heatmap = output.heatmap if isinstance(output, HeatmapElement) else output
@@ -680,6 +762,8 @@ def eval(
             offset_loss_fn=offset_loss_fn,
             heatmap_sigma=heatmap_sigma,
             offset_loss_weight=offset_loss_weight,
+            center_loss_weight=center_loss_weight,
+            softargmax_temperature=softargmax_temperature,
             use_distance_bias=use_distance_bias,
             gamma=gamma,
             heatmap_mode=heatmap_mode,
@@ -701,6 +785,7 @@ def eval(
         losses.append(float(loss_output.loss.detach().cpu()))
         heatmap_losses.append(float(loss_output.heatmap_loss.detach().cpu()))
         offset_losses.append(float(loss_output.offset_loss.detach().cpu()))
+        center_losses.append(float(loss_output.center_loss.detach().cpu()))
 
     predicted_tensor = torch.stack(predicted_centers)
     label_tensor = torch.stack(label_centers)
@@ -715,6 +800,7 @@ def eval(
         "loss": float(np.mean(losses)),
         "heatmap_loss": float(np.mean(heatmap_losses)),
         "offset_loss": float(np.mean(offset_losses)),
+        "center_loss": float(np.mean(center_losses)),
         "standard_distance": float(distances.mean().item()),
         "median_distance": float(distances.median().item()),
         "video_path": str(video_path),
@@ -722,9 +808,27 @@ def eval(
         "last_heatmap_path": str(last_heatmap_path),
         "metrics_path": str(metrics_path),
         "play_command": f"python -c \"import os; os.startfile(r'{video_path}')\"",
-        "predicted_centers": predicted_tensor.tolist(),
-        "label_centers": label_tensor.tolist(),
     }
+    if heatmap_predicted_centers:
+        heatmap_predicted_tensor = torch.stack(heatmap_predicted_centers)
+        heatmap_distances = torch.linalg.norm(heatmap_predicted_tensor - label_tensor, dim=1)
+        heatmap_hits = heatmap_distances <= hit_radius
+        metrics.update(
+            {
+                "heatmap_eval_mode": "all" if dummy_positions_batch is not None else "target",
+                "heatmap_eval_loss": float(np.mean(heatmap_losses_from_part)),
+                "heatmap_heatmap_loss": float(np.mean(heatmap_heatmap_losses_from_part)),
+                "heatmap_offset_loss": float(np.mean(heatmap_offset_losses_from_part)),
+                "heatmap_center_loss": float(np.mean(heatmap_center_losses_from_part)),
+                "heatmap_accuracy": float(heatmap_hits.float().mean().item()),
+                "heatmap_standard_distance": float(heatmap_distances.mean().item()),
+                "heatmap_median_distance": float(heatmap_distances.median().item()),
+            }
+        )
+    metrics["predicted_centers"] = predicted_tensor.tolist()
+    metrics["label_centers"] = label_tensor.tolist()
+    if heatmap_predicted_centers:
+        metrics["heatmap_predicted_centers"] = heatmap_predicted_tensor.tolist()
 
     _draw_centers_video(
         frames,
@@ -767,6 +871,8 @@ def train_heatmap(
     run_root: str | Path = "runs",
     heatmap_sigma: float = 4.0,
     offset_loss_weight: float = 1.0,
+    center_loss_weight: float = 0.01,
+    softargmax_temperature: float = 0.25,
     wandb_active: bool = False,
     wandb_project: str = "LieDA",
     use_distance_bias: bool = False,
@@ -829,6 +935,8 @@ def train_heatmap(
                 "loaded_step": None if loaded_checkpoint is None else loaded_checkpoint.get("step", 0),
                 "heatmap_sigma": heatmap_sigma,
                 "offset_loss_weight": offset_loss_weight,
+                "center_loss_weight": center_loss_weight,
+                "softargmax_temperature": softargmax_temperature,
                 "use_distance_bias": use_distance_bias,
                 "gamma": gamma,
                 "heatmap_mode": heatmap_mode,
@@ -843,6 +951,8 @@ def train_heatmap(
         "crop_size": crop_size,
         "heatmap_sigma": heatmap_sigma,
         "offset_loss_weight": offset_loss_weight,
+        "center_loss_weight": center_loss_weight,
+        "softargmax_temperature": softargmax_temperature,
         "use_distance_bias": use_distance_bias,
         "gamma": gamma,
         "heatmap_mode": heatmap_mode,
@@ -856,6 +966,7 @@ def train_heatmap(
     early_stop_patience = 5
     train_start_time = time.perf_counter()
     for step in progress:
+        early_stop_triggered = False
         step_start_time = time.perf_counter()
         batch_data = next(data_iter)
         frames = _batch_inputs(batch_data).to(device, non_blocking=True)
@@ -880,6 +991,7 @@ def train_heatmap(
         step_losses: list[float] = []
         step_heatmap_losses: list[float] = []
         step_offset_losses: list[float] = []
+        step_center_losses: list[float] = []
         semistep_count = frames.shape[1] - 4
         for semistep in range(semistep_count):
             inputs = make_semistep_inputs(
@@ -916,6 +1028,8 @@ def train_heatmap(
                 offset_loss_fn=offset_loss_fn,
                 heatmap_sigma=heatmap_sigma,
                 offset_loss_weight=offset_loss_weight,
+                center_loss_weight=center_loss_weight,
+                softargmax_temperature=softargmax_temperature,
                 use_distance_bias=use_distance_bias,
                 gamma=gamma,
                 heatmap_mode=heatmap_mode,
@@ -931,17 +1045,20 @@ def train_heatmap(
                 "loss": float(loss_output.loss.detach().cpu()),
                 "heatmap_loss": float(loss_output.heatmap_loss.detach().cpu()),
                 "offset_loss": float(loss_output.offset_loss.detach().cpu()),
+                "center_loss": float(loss_output.center_loss.detach().cpu()),
                 "step": step,
                 "semistep": semistep,
             }
             step_losses.append(metrics["loss"])
             step_heatmap_losses.append(metrics["heatmap_loss"])
             step_offset_losses.append(metrics["offset_loss"])
+            step_center_losses.append(metrics["center_loss"])
             if hasattr(progress, "set_postfix"):
                 progress.set_postfix(
                     loss=metrics["loss"],
                     heatmap=metrics["heatmap_loss"],
                     offset=metrics["offset_loss"],
+                    center=metrics["center_loss"],
                     semistep=semistep,
                 )
             if wandb_run is not None:
@@ -951,6 +1068,7 @@ def train_heatmap(
             "step_loss": float(np.mean(step_losses)),
             "step_heatmap_loss": float(np.mean(step_heatmap_losses)),
             "step_offset_loss": float(np.mean(step_offset_losses)),
+            "step_center_loss": float(np.mean(step_center_losses)),
             "step": step + 1,
         }
         _sync_device(device)
@@ -963,6 +1081,7 @@ def train_heatmap(
             f"loss={step_metrics['step_loss']:.6f} "
             f"heatmap={step_metrics['step_heatmap_loss']:.6f} "
             f"offset={step_metrics['step_offset_loss']:.6f} "
+            f"center={step_metrics['step_center_loss']:.6f} "
             f"time={step_train_seconds:.2f}s"
         )
         if wandb_run is not None:
@@ -984,7 +1103,7 @@ def train_heatmap(
                     f"[train] early stop: loss did not improve for "
                     f"{early_stop_patience} steps."
                 )
-                break
+                early_stop_triggered = True
 
         if save_step > 0 and (step + 1) % save_step == 0:
             checkpoint_path = run_dir / "checkpoints" / f"step_{step + 1:06d}.pt"
@@ -998,7 +1117,7 @@ def train_heatmap(
             last_saved_step = step + 1
             print(f"[train] checkpoint saved: {checkpoint_path}")
 
-        if eval_step > 0 and (step + 1) % eval_step == 0:
+        if eval_step > 0 and (early_stop_triggered or (step + 1) % eval_step == 0):
             eval_metrics = eval(
                 model,
                 frames[0].detach().cpu(),
@@ -1011,6 +1130,8 @@ def train_heatmap(
                 crop_size=crop_size,
                 heatmap_sigma=heatmap_sigma,
                 offset_loss_weight=offset_loss_weight,
+                center_loss_weight=center_loss_weight,
+                softargmax_temperature=softargmax_temperature,
                 use_distance_bias=use_distance_bias,
                 gamma=gamma,
                 train_elapsed_seconds=train_elapsed_seconds,
@@ -1030,6 +1151,7 @@ def train_heatmap(
                         "eval/loss": eval_metrics["loss"],
                         "eval/heatmap_loss": eval_metrics["heatmap_loss"],
                         "eval/offset_loss": eval_metrics["offset_loss"],
+                        "eval/center_loss": eval_metrics["center_loss"],
                         "eval/standard_distance": eval_metrics["standard_distance"],
                         "eval/eval_time_seconds": eval_metrics["eval_time_seconds"],
                         "eval/train_elapsed_seconds": eval_metrics["train_elapsed_seconds"],
@@ -1037,6 +1159,9 @@ def train_heatmap(
                     },
                     step=(step + 1) * semistep_count,
                 )
+
+        if early_stop_triggered:
+            break
 
     if wandb_run is not None:
         wandb_run.finish()
@@ -1070,6 +1195,8 @@ def train_gru(
     run_root: str | Path = "runs",
     heatmap_sigma: float = 4.0,
     offset_loss_weight: float = 1.0,
+    center_loss_weight: float = 0.01,
+    softargmax_temperature: float = 0.25,
     sequence_chunk_length: int = 8,
     heatmap_freeze: bool = True,
     GRU_freeze: bool = False,
@@ -1149,6 +1276,8 @@ def train_gru(
                 "run_dir": str(run_dir),
                 "heatmap_sigma": heatmap_sigma,
                 "offset_loss_weight": offset_loss_weight,
+                "center_loss_weight": center_loss_weight,
+                "softargmax_temperature": softargmax_temperature,
                 "sequence_chunk_length": sequence_chunk_length,
                 "heatmap_freeze": heatmap_freeze,
                 "GRU_freeze": GRU_freeze,
@@ -1173,6 +1302,8 @@ def train_gru(
         "save_step": save_step,
         "heatmap_sigma": heatmap_sigma,
         "offset_loss_weight": offset_loss_weight,
+        "center_loss_weight": center_loss_weight,
+        "softargmax_temperature": softargmax_temperature,
         "sequence_chunk_length": sequence_chunk_length,
         "heatmap_freeze": heatmap_freeze,
         "GRU_freeze": GRU_freeze,
@@ -1195,10 +1326,21 @@ def train_gru(
     early_stop_patience = 5
     train_start_time = time.perf_counter()
     for step in progress:
+        early_stop_triggered = False
         step_start_time = time.perf_counter()
         batch_data = next(data_iter)
         frames = _batch_inputs(batch_data).to(device, non_blocking=True)
         positions = _batch_positions(batch_data).to(device, dtype=frames.dtype, non_blocking=True)
+        try:
+            dummy_positions = _batch_dummy_positions(batch_data).to(
+                device,
+                dtype=frames.dtype,
+                non_blocking=True,
+            )
+            dummy_mask = _batch_dummy_mask(batch_data).to(device, non_blocking=True)
+        except KeyError:
+            dummy_positions = None
+            dummy_mask = None
         if frames.ndim != 5 or frames.shape[1:] != (300, 3, 600, 600):
             raise ValueError(
                 "Expected dataloader frames with shape (B, 300, 3, 600, 600), "
@@ -1212,6 +1354,7 @@ def train_gru(
         step_losses: list[float] = []
         step_heatmap_losses: list[float] = []
         step_offset_losses: list[float] = []
+        step_center_losses: list[float] = []
         semistep_count = frames.shape[1] - 4
 
         for chunk_start in range(0, semistep_count, sequence_chunk_length):
@@ -1221,6 +1364,7 @@ def train_gru(
             chunk_size = 0
             chunk_heatmap_losses: list[float] = []
             chunk_offset_losses: list[float] = []
+            chunk_center_losses: list[float] = []
 
             for semistep in range(chunk_start, chunk_end):
                 inputs = make_semistep_inputs(
@@ -1243,12 +1387,15 @@ def train_gru(
                     offset_loss_fn=offset_loss_fn,
                     heatmap_sigma=heatmap_sigma,
                     offset_loss_weight=offset_loss_weight,
+                    center_loss_weight=center_loss_weight,
+                    softargmax_temperature=softargmax_temperature,
                     heatmap_mode="target",
                 )
                 chunk_loss = chunk_loss + loss_output.loss
                 chunk_size += 1
                 chunk_heatmap_losses.append(float(loss_output.heatmap_loss.detach().cpu()))
                 chunk_offset_losses.append(float(loss_output.offset_loss.detach().cpu()))
+                chunk_center_losses.append(float(loss_output.center_loss.detach().cpu()))
 
             chunk_loss = chunk_loss / max(chunk_size, 1)
             chunk_loss.backward()
@@ -1258,14 +1405,17 @@ def train_gru(
             loss_value = float(chunk_loss.detach().cpu())
             heatmap_loss_value = float(np.mean(chunk_heatmap_losses))
             offset_loss_value = float(np.mean(chunk_offset_losses))
+            center_loss_value = float(np.mean(chunk_center_losses))
             step_losses.append(loss_value)
             step_heatmap_losses.append(heatmap_loss_value)
             step_offset_losses.append(offset_loss_value)
+            step_center_losses.append(center_loss_value)
             if hasattr(progress, "set_postfix"):
                 progress.set_postfix(
                     loss=loss_value,
                     heatmap=heatmap_loss_value,
                     offset=offset_loss_value,
+                    center=center_loss_value,
                     chunk=f"{chunk_start}:{chunk_end}",
                 )
             if wandb_run is not None:
@@ -1274,6 +1424,7 @@ def train_gru(
                         "loss": loss_value,
                         "heatmap_loss": heatmap_loss_value,
                         "offset_loss": offset_loss_value,
+                        "center_loss": center_loss_value,
                         "step": step,
                         "chunk_start": chunk_start,
                         "chunk_end": chunk_end,
@@ -1288,11 +1439,13 @@ def train_gru(
         step_loss = float(np.mean(step_losses))
         step_heatmap_loss = float(np.mean(step_heatmap_losses))
         step_offset_loss = float(np.mean(step_offset_losses))
+        step_center_loss = float(np.mean(step_center_losses))
         print(
             f"gru step {step + 1}/{steps} "
             f"loss={step_loss:.6f} "
             f"heatmap={step_heatmap_loss:.6f} "
             f"offset={step_offset_loss:.6f} "
+            f"center={step_center_loss:.6f} "
             f"time={step_train_seconds:.2f}s "
             f"elapsed={train_elapsed_seconds:.2f}s"
         )
@@ -1302,6 +1455,7 @@ def train_gru(
                     "step_loss": step_loss,
                     "step_heatmap_loss": step_heatmap_loss,
                     "step_offset_loss": step_offset_loss,
+                    "step_center_loss": step_center_loss,
                     "step": step + 1,
                     "step_train_seconds": step_train_seconds,
                     "train_elapsed_seconds": train_elapsed_seconds,
@@ -1324,7 +1478,7 @@ def train_gru(
                     f"[train_gru] early stop: loss did not improve for "
                     f"{early_stop_patience} steps."
                 )
-                break
+                early_stop_triggered = True
 
         if save_step > 0 and (step + 1) % save_step == 0:
             checkpoint_path = run_dir / "checkpoints" / f"step_{step + 1:06d}.pt"
@@ -1338,17 +1492,21 @@ def train_gru(
             last_saved_step = step + 1
             print(f"[train_gru] checkpoint saved: {checkpoint_path}")
 
-        if eval_step > 0 and (step + 1) % eval_step == 0:
+        if eval_step > 0 and (early_stop_triggered or (step + 1) % eval_step == 0):
             eval_metrics = eval(
                 model,
                 frames[0].detach().cpu(),
                 positions[0].detach().cpu(),
+                dummy_positions=None if dummy_positions is None else dummy_positions[0].detach().cpu(),
+                dummy_mask=None if dummy_mask is None else dummy_mask[0].detach().cpu(),
                 output_dir=run_dir / "eval",
                 name=f"step_{step + 1:06d}",
                 device=device,
                 crop_size=crop_size,
                 heatmap_sigma=heatmap_sigma,
                 offset_loss_weight=offset_loss_weight,
+                center_loss_weight=center_loss_weight,
+                softargmax_temperature=softargmax_temperature,
                 use_distance_bias=use_distance_bias,
                 gamma=gamma,
                 train_elapsed_seconds=train_elapsed_seconds,
@@ -1368,13 +1526,29 @@ def train_gru(
                         "eval/loss": eval_metrics["loss"],
                         "eval/heatmap_loss": eval_metrics["heatmap_loss"],
                         "eval/offset_loss": eval_metrics["offset_loss"],
+                        "eval/center_loss": eval_metrics["center_loss"],
                         "eval/standard_distance": eval_metrics["standard_distance"],
                         "eval/eval_time_seconds": eval_metrics["eval_time_seconds"],
                         "eval/train_elapsed_seconds": eval_metrics["train_elapsed_seconds"],
                         "eval/step_train_seconds": eval_metrics["step_train_seconds"],
+                        **(
+                            {
+                                "eval/heatmap_eval_loss": eval_metrics["heatmap_eval_loss"],
+                                "eval/heatmap_heatmap_loss": eval_metrics["heatmap_heatmap_loss"],
+                                "eval/heatmap_offset_loss": eval_metrics["heatmap_offset_loss"],
+                                "eval/heatmap_center_loss": eval_metrics["heatmap_center_loss"],
+                                "eval/heatmap_accuracy": eval_metrics["heatmap_accuracy"],
+                                "eval/heatmap_standard_distance": eval_metrics["heatmap_standard_distance"],
+                            }
+                            if "heatmap_eval_loss" in eval_metrics
+                            else {}
+                        ),
                     },
                     step=(step + 1) * semistep_count,
                 )
+
+        if early_stop_triggered:
+            break
 
     if wandb_run is not None:
         wandb_run.finish()
@@ -1419,28 +1593,28 @@ if __name__ == "__main__":
     }
 
     # 1. difficulty 1: train PartialUNet heatmap model only.
-    #train(
-    #    PartialHeatUNet(in_channels=7),
-    #    my_dataloader(difficulty=1, batch=common["batch"]),
-    #    model_type="heatmap",
-    #    heatmap_mode="all",
-    #    **common,
-    #)
+    train(
+       PartialHeatUNet(in_channels=7),
+       my_dataloader(difficulty=1, batch=common["batch"]),
+       model_type="heatmap",
+       heatmap_mode="all",
+       **common,
+    )
 
     # 2. difficulty 1: load latest heatmap into LieDA, freeze heatmap, train GRU only.
-    train(
-         LieDA(
-             PartialHeatUNet(in_channels=7),
-             heatmap_freeze=True,
-             GRU_freeze=False,
-         ),
-         my_dataloader(difficulty=1, batch=common["batch"]),
-         model_type="gru",
-         heatmap_params="latest",
-         heatmap_freeze=True,
-         GRU_freeze=False,
-         **common,
-     )
+    # train(
+    #      LieDA(
+    #          PartialHeatUNet(in_channels=7),
+    #          heatmap_freeze=True,
+    #          GRU_freeze=False,
+    #      ),
+    #      my_dataloader(difficulty=1, batch=common["batch"]),
+    #      model_type="gru",
+    #      heatmap_params="latest",
+    #      heatmap_freeze=True,
+    #      GRU_freeze=False,
+    #      **common,
+    #  )
 
     # 3. difficulty 2: train heatmap side only.
     # train(
