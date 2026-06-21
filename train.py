@@ -499,12 +499,19 @@ def load_checkpoint(
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         model.load_state_dict(checkpoint["model_state_dict"])
+
         if optimizer is not None and "optimizer_state_dict" in checkpoint:
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            for state in optimizer.state.values():
-                for key, value in state.items():
-                    if torch.is_tensor(value):
-                        state[key] = value.to(device)
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                for state in optimizer.state.values():
+                    for key, value in state.items():
+                        if torch.is_tensor(value):
+                            state[key] = value.to(device)
+            except ValueError as e:
+                print("[train][WARN] optimizer_state_dict mismatch.")
+                print("[train][WARN] Model weights were loaded, but optimizer will start fresh.")
+                print(f"[train][WARN] {e}")
+
         loaded_step = int(checkpoint.get("step", 0))
     else:
         model.load_state_dict(checkpoint)
@@ -1617,16 +1624,16 @@ if __name__ == "__main__":
     common["experiment_name"] = experiment_name
 
     # 1. difficulty 1: train PartialUNet heatmap model only.
-    train(
-       PartialHeatUNet(in_channels=7),
-       my_dataloader(difficulty=1, batch=common["batch"]),
-       model_type="heatmap",
-       heatmap_mode="all",
-       **common,
-    )
+    #train(
+    #   PartialHeatUNet(in_channels=7),
+    #   my_dataloader(difficulty=1, batch=common["batch"]),
+    #   model_type="heatmap",
+    #   heatmap_mode="all",
+    #   **common,
+    #)
 
     # 2. difficulty 1: load latest heatmap into LieDA, freeze heatmap, train GRU only.
-    # train(
+    #train(
     #      LieDA(
     #          PartialHeatUNet(in_channels=7),
     #          heatmap_freeze=True,
@@ -1641,34 +1648,34 @@ if __name__ == "__main__":
     #  )
 
     # 3. difficulty 2: train heatmap side only.
-    # train(
-    #     LieDA(
+    #train(
+    #    LieDA(
     #         PartialHeatUNet(in_channels=7),
     #         heatmap_freeze=False,
     #         GRU_freeze=True,
-    #     ),
-    #     my_dataloader(difficulty=2, batch=common["batch"]),
-    #     model_type="gru",
-    #     params="latest",
-    #     heatmap_freeze=False,
-    #     GRU_freeze=True,
-    #     **common,
+    #    ),
+    #    my_dataloader(difficulty=2, batch=common["batch"]),
+    #    model_type="gru",
+    #    params="latest",
+    #    heatmap_freeze=False,
+    #    GRU_freeze=True,
+    #    **common,
     # )
 
     # 4. difficulty 2: freeze heatmap, train GRU only.
-    # train(
-    #     LieDA(
-    #         PartialHeatUNet(in_channels=7),
-    #         heatmap_freeze=True,
-    #         GRU_freeze=False,
-    #     ),
-    #     my_dataloader(difficulty=2, batch=common["batch"]),
-    #     model_type="gru",
-    #     params="latest",
-    #     heatmap_freeze=True,
-    #     GRU_freeze=False,
-    #     **common,
-    # )
+    train(
+         LieDA(
+             PartialHeatUNet(in_channels=7),
+             heatmap_freeze=True,
+             GRU_freeze=False,
+         ),
+         my_dataloader(difficulty=2, batch=common["batch"]),
+         model_type="gru",
+         params="latest",
+         heatmap_freeze=True,
+         GRU_freeze=False,
+         **common,
+     )
 
     # 5. difficulty 3: train heatmap side only.
     # train(
