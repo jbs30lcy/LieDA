@@ -132,7 +132,7 @@ class NormalDataset(TextureDataset):
 def my_dataloader(
     *,
     difficulty: int = 1,
-    batch: int = 16,
+    batch: int = 8,
     n_frames: int = 300,
     output_size: int = 600,
     num_workers: int = 0,
@@ -140,7 +140,8 @@ def my_dataloader(
     seed: int | None = None,
 ) -> DataLoader:
     if pin_memory is None:
-        pin_memory = torch.cuda.is_available()
+        pin_memory = False
+        #pin_memory = torch.cuda.is_available()
 
     if difficulty == 1:
         return DataLoader(

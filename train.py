@@ -801,7 +801,8 @@ def train_heatmap(
         dataloader = my_dataloader(
             difficulty=1,
             batch=batch,
-            pin_memory=device.type == "cuda",
+            pin_memory=False,
+            #pin_memory=device.type == "cuda",
         )
 
     run_dir = make_run_dir(run_root)
@@ -1121,7 +1122,8 @@ def train_gru(
         dataloader = my_dataloader(
             difficulty=1,
             batch=batch,
-            pin_memory=device.type == "cuda",
+            pin_memory=False,
+            #pin_memory=device.type == "cuda",
         )
 
     run_dir = make_run_dir(run_root)
@@ -1409,7 +1411,7 @@ def train(
 if __name__ == "__main__":
     common = {
         "steps": 300,
-        "batch": 4,
+        "batch": 2,
         "eval_step": 12,
         "save_step": 12,
         "heatmap_sigma": 4,
@@ -1417,28 +1419,28 @@ if __name__ == "__main__":
     }
 
     # 1. difficulty 1: train PartialUNet heatmap model only.
-    train(
-        PartialHeatUNet(in_channels=7),
-        my_dataloader(difficulty=1, batch=common["batch"]),
-        model_type="heatmap",
-        heatmap_mode="all",
-        **common,
-    )
+    #train(
+    #    PartialHeatUNet(in_channels=7),
+    #    my_dataloader(difficulty=1, batch=common["batch"]),
+    #    model_type="heatmap",
+    #    heatmap_mode="all",
+    #    **common,
+    #)
 
     # 2. difficulty 1: load latest heatmap into LieDA, freeze heatmap, train GRU only.
-    # train(
-    #     LieDA(
-    #         PartialHeatUNet(in_channels=7),
-    #         heatmap_freeze=True,
-    #         GRU_freeze=False,
-    #     ),
-    #     my_dataloader(difficulty=1, batch=common["batch"]),
-    #     model_type="gru",
-    #     heatmap_params="latest",
-    #     heatmap_freeze=True,
-    #     GRU_freeze=False,
-    #     **common,
-    # )
+    train(
+         LieDA(
+             PartialHeatUNet(in_channels=7),
+             heatmap_freeze=True,
+             GRU_freeze=False,
+         ),
+         my_dataloader(difficulty=1, batch=common["batch"]),
+         model_type="gru",
+         heatmap_params="latest",
+         heatmap_freeze=True,
+         GRU_freeze=False,
+         **common,
+     )
 
     # 3. difficulty 2: train heatmap side only.
     # train(
