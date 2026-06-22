@@ -206,178 +206,33 @@ class PartialHeatUNet(nn.Module):
         )
 
 
-class ConvGRUCell(nn.Module):
-    """GRU cell that keeps spatial hidden state as (B, C, H, W)."""
-
-    def __init__(
-        self,
-        input_channels: int,
-        hidden_channels: int = 16,
-        kernel_size: int = 3,
-    ) -> None:
-        super().__init__()
-        padding = kernel_size // 2
-        gate_channels = input_channels + hidden_channels
-        self.hidden_channels = hidden_channels
-        self.update_gate = nn.Conv2d(gate_channels, hidden_channels, kernel_size, padding=padding)
-        self.reset_gate = nn.Conv2d(gate_channels, hidden_channels, kernel_size, padding=padding)
-        self.candidate = nn.Conv2d(gate_channels, hidden_channels, kernel_size, padding=padding)
-
-    def forward(self, x: Tensor, hidden: Tensor | None = None) -> Tensor:
-        if hidden is None:
-            hidden = x.new_zeros(
-                x.shape[0],
-                self.hidden_channels,
-                x.shape[-2],
-                x.shape[-1],
-            )
-        if hidden.shape[0] != x.shape[0] or hidden.shape[-2:] != x.shape[-2:]:
-            raise ValueError(
-                "hidden must have the same batch size and spatial shape as x, "
-                f"got hidden={tuple(hidden.shape)} x={tuple(x.shape)}."
-            )
-
-        combined = torch.cat((x, hidden), dim=1)
-        update = torch.sigmoid(self.update_gate(combined))
-        reset = torch.sigmoid(self.reset_gate(combined))
-        candidate = torch.tanh(self.candidate(torch.cat((x, reset * hidden), dim=1)))
-        return (1.0 - update) * hidden + update * candidate
-
-
-class LieDA(nn.Module):
-    """Heatmap model followed by a ConvGRU target selector."""
+class MergeNet(nn.Module):
+    """Merge current all-object heatmap with previous target heatmap."""
 
     def __init__(
         self,
         heatmap_model: nn.Module,
         *,
-        gru_hidden_channels: int = 16,
-        gru_kernel_size: int = 3,
-        gru_layers: int = 1,
+        merge_channels: tuple[int, ...] = (16, 16, 16),
         heatmap_freeze: bool = False,
-        GRU_freeze: bool = False,
-    ) -> None:
-        super().__init__()
-        if gru_layers < 1:
-            raise ValueError("gru_layers must be at least 1.")
-        self.heatmap_model = heatmap_model
-        self.gru = nn.ModuleList(
-            [
-                ConvGRUCell(
-                    input_channels=3 if layer_idx == 0 else gru_hidden_channels,
-                    hidden_channels=gru_hidden_channels,
-                    kernel_size=gru_kernel_size,
-                )
-                for layer_idx in range(gru_layers)
-            ]
-        )
-        self.output_head = nn.Conv2d(gru_hidden_channels, 3, kernel_size=1)
-        self.set_heatmap_freeze(heatmap_freeze)
-        self.set_GRU_freeze(GRU_freeze)
-
-    def set_heatmap_freeze(self, freeze: bool = True) -> None:
-        for parameter in self.heatmap_model.parameters():
-            parameter.requires_grad_(not freeze)
-
-    def set_GRU_freeze(self, freeze: bool = True) -> None:
-        for module in (self.gru, self.output_head):
-            for parameter in module.parameters():
-                parameter.requires_grad_(not freeze)
-
-    def heatmap_parameters(self):
-        return self.heatmap_model.parameters()
-
-    def GRU_parameters(self):
-        for parameter in self.gru.parameters():
-            yield parameter
-        yield from self.output_head.parameters()
-
-    def load_heatmap_state_dict(self, state_dict: dict[str, Tensor], *, strict: bool = True):
-        heatmap_prefix = "heatmap_model."
-        if any(key.startswith(heatmap_prefix) for key in state_dict):
-            state_dict = {
-                key[len(heatmap_prefix) :]: value
-                for key, value in state_dict.items()
-                if key.startswith(heatmap_prefix)
-            }
-        return self.heatmap_model.load_state_dict(state_dict, strict=strict)
-
-    def forward_step(
-        self,
-        x: Tensor,
-        hidden: list[Tensor] | None = None,
-    ) -> tuple[HeatmapElement, list[Tensor], HeatmapElement]:
-        heatmap_trainable = any(parameter.requires_grad for parameter in self.heatmap_model.parameters())
-        if heatmap_trainable:
-            all_output = self.heatmap_model(x)
-        else:
-            with torch.no_grad():
-                all_output = self.heatmap_model(x)
-        if not isinstance(all_output, HeatmapElement):
-            raise TypeError("LieDA heatmap_model must return HeatmapElement.")
-
-        gru_input = torch.cat((all_output.heatmap, all_output.offset), dim=1)
-        if hidden is None:
-            hidden = [None] * len(self.gru)
-        if len(hidden) != len(self.gru):
-            raise ValueError(f"hidden must contain {len(self.gru)} tensors.")
-
-        features = gru_input
-        next_hidden: list[Tensor] = []
-        for layer, layer_hidden in zip(self.gru, hidden):
-            features = layer(features, layer_hidden)
-            next_hidden.append(features)
-
-        target_output = self.output_head(features)
-        return (
-            HeatmapElement(heatmap=target_output[:, :1], offset=target_output[:, 1:]),
-            next_hidden,
-            all_output,
-        )
-
-    def forward(self, x: Tensor, hidden: list[Tensor] | None = None):
-        if x.ndim == 4:
-            target_output, next_hidden, _all_output = self.forward_step(x, hidden)
-            return target_output if hidden is None else (target_output, next_hidden)
-        if x.ndim != 5:
-            raise ValueError("x must have shape (B, C, H, W) or (B, T, C, H, W).")
-
-        outputs: list[HeatmapElement] = []
-        next_hidden = hidden
-        for frame_idx in range(x.shape[1]):
-            output, next_hidden, _all_output = self.forward_step(x[:, frame_idx], next_hidden)
-            outputs.append(output)
-        return HeatmapElement(
-            heatmap=torch.stack([output.heatmap for output in outputs], dim=1),
-            offset=torch.stack([output.offset for output in outputs], dim=1),
-        )
-
-
-class noHiddenLieDA(nn.Module):
-    """Heatmap selector that uses previous target output directly instead of hidden state."""
-
-    def __init__(
-        self,
-        heatmap_model: nn.Module,
-        *,
-        selector_channels: tuple[int, ...] = (32, 32, 32),
-        heatmap_freeze: bool = False,
-        selector_freeze: bool = False,
+        merge_freeze: bool = False,
         teacher_forcing: float = 1.0,
         initial_target_center: tuple[float, float] = (300.0, 300.0),
         initial_target_input_size: int = 600,
+        initial_target_sigma: float = 4.0,
     ) -> None:
         super().__init__()
-        if not selector_channels:
-            raise ValueError("selector_channels must contain at least one stage.")
+        if not merge_channels:
+            raise ValueError("merge_channels must contain at least one stage.")
         self.heatmap_model = heatmap_model
-        self.set_teacher_forcing(teacher_forcing)
         self.initial_target_center = initial_target_center
         self.initial_target_input_size = int(initial_target_input_size)
+        self.initial_target_sigma = float(initial_target_sigma)
+        self.set_teacher_forcing(teacher_forcing)
 
         layers: list[nn.Module] = []
-        prev_channels = 6
-        for next_channels in selector_channels:
+        prev_channels = 2
+        for next_channels in merge_channels:
             layers.extend(
                 [
                     nn.Conv2d(prev_channels, next_channels, kernel_size=3, padding=1),
@@ -386,11 +241,11 @@ class noHiddenLieDA(nn.Module):
                 ]
             )
             prev_channels = next_channels
-        layers.append(nn.Conv2d(prev_channels, 3, kernel_size=1))
-        self.selector = nn.Sequential(*layers)
+        layers.append(nn.Conv2d(prev_channels, 1, kernel_size=1))
+        self.merge_model = nn.Sequential(*layers)
 
         self.set_heatmap_freeze(heatmap_freeze)
-        self.set_selector_freeze(selector_freeze)
+        self.set_merge_freeze(merge_freeze)
 
     def set_teacher_forcing(self, teacher_forcing: float) -> None:
         teacher_forcing = float(teacher_forcing)
@@ -402,21 +257,15 @@ class noHiddenLieDA(nn.Module):
         for parameter in self.heatmap_model.parameters():
             parameter.requires_grad_(not freeze)
 
-    def set_selector_freeze(self, freeze: bool = True) -> None:
-        for parameter in self.selector.parameters():
+    def set_merge_freeze(self, freeze: bool = True) -> None:
+        for parameter in self.merge_model.parameters():
             parameter.requires_grad_(not freeze)
-
-    def set_GRU_freeze(self, freeze: bool = True) -> None:
-        self.set_selector_freeze(freeze)
 
     def heatmap_parameters(self):
         return self.heatmap_model.parameters()
 
-    def selector_parameters(self):
-        return self.selector.parameters()
-
-    def GRU_parameters(self):
-        return self.selector_parameters()
+    def merge_parameters(self):
+        return self.merge_model.parameters()
 
     def load_heatmap_state_dict(self, state_dict: dict[str, Tensor], *, strict: bool = True):
         heatmap_prefix = "heatmap_model."
@@ -428,39 +277,6 @@ class noHiddenLieDA(nn.Module):
             }
         return self.heatmap_model.load_state_dict(state_dict, strict=strict)
 
-    @staticmethod
-    def _element_to_tensor(element: HeatmapElement) -> Tensor:
-        return torch.cat((element.heatmap, element.offset), dim=1)
-
-    @staticmethod
-    def _tensor_to_element(tensor: Tensor) -> HeatmapElement:
-        return HeatmapElement(heatmap=tensor[:, :1], offset=tensor[:, 1:])
-
-    @staticmethod
-    def _zero_like_element(element: HeatmapElement) -> HeatmapElement:
-        return HeatmapElement(
-            heatmap=torch.zeros_like(element.heatmap),
-            offset=torch.zeros_like(element.offset),
-        )
-
-    def _initial_target_like(self, element: HeatmapElement) -> HeatmapElement:
-        heatmap = torch.zeros_like(element.heatmap)
-        offset = torch.zeros_like(element.offset)
-        batch_size, _channels, height, width = heatmap.shape
-        center_x, center_y = self.initial_target_center
-        stride_x = self.initial_target_input_size / float(width)
-        stride_y = self.initial_target_input_size / float(height)
-        grid_x = heatmap.new_tensor(center_x / stride_x)
-        grid_y = heatmap.new_tensor(center_y / stride_y)
-        cell_x = torch.floor(grid_x).long().clamp(0, width - 1)
-        cell_y = torch.floor(grid_y).long().clamp(0, height - 1)
-        batch_indices = torch.arange(batch_size, device=heatmap.device)
-
-        heatmap[batch_indices, 0, cell_y, cell_x] = 1.0
-        offset[batch_indices, 0, cell_y, cell_x] = grid_x - cell_x.to(heatmap.dtype) - 0.5
-        offset[batch_indices, 1, cell_y, cell_x] = grid_y - cell_y.to(heatmap.dtype) - 0.5
-        return HeatmapElement(heatmap=heatmap, offset=offset)
-
     def _heatmap_forward(self, x: Tensor) -> HeatmapElement:
         heatmap_trainable = any(parameter.requires_grad for parameter in self.heatmap_model.parameters())
         if heatmap_trainable:
@@ -469,89 +285,102 @@ class noHiddenLieDA(nn.Module):
             with torch.no_grad():
                 all_output = self.heatmap_model(x)
         if not isinstance(all_output, HeatmapElement):
-            raise TypeError("noHiddenLieDA heatmap_model must return HeatmapElement.")
+            raise TypeError("MergeNet heatmap_model must return HeatmapElement.")
         return all_output
+
+    def _initial_target_like(self, heatmap: Tensor) -> Tensor:
+        batch_size, _channels, height, width = heatmap.shape
+        center_x, center_y = self.initial_target_center
+        stride_x = self.initial_target_input_size / float(width)
+        stride_y = self.initial_target_input_size / float(height)
+        grid_x = heatmap.new_tensor(center_x / stride_x)
+        grid_y = heatmap.new_tensor(center_y / stride_y)
+
+        ys = torch.arange(height, device=heatmap.device, dtype=heatmap.dtype).view(1, 1, height, 1)
+        xs = torch.arange(width, device=heatmap.device, dtype=heatmap.dtype).view(1, 1, 1, width)
+        distance2 = (xs - grid_x).square() + (ys - grid_y).square()
+        initial = torch.exp(distance2 / (-2.0 * self.initial_target_sigma * self.initial_target_sigma))
+        return initial.expand(batch_size, 1, height, width).contiguous()
+
+    def choose_next_target(
+        self,
+        output_heatmap: Tensor,
+        teacher_target: Tensor | None = None,
+        teacher_forcing: float | None = None,
+    ) -> Tensor:
+        teacher_forcing = self.teacher_forcing if teacher_forcing is None else float(teacher_forcing)
+        if not 0.0 <= teacher_forcing <= 1.0:
+            raise ValueError(f"teacher_forcing must be in [0, 1], got {teacher_forcing}.")
+        if self.training and teacher_target is not None and teacher_forcing > 0.0:
+            semistep_sample = torch.rand((), device=output_heatmap.device).item()
+            if teacher_forcing >= 1.0 or semistep_sample < teacher_forcing:
+                return teacher_target
+        return output_heatmap
 
     def forward_step(
         self,
         x: Tensor,
-        prev_target: HeatmapElement | None = None,
-        teacher_target: HeatmapElement | None = None,
+        prev_target_heatmap: Tensor | None = None,
+        teacher_target: Tensor | None = None,
         teacher_forcing: float | None = None,
-    ) -> tuple[HeatmapElement, HeatmapElement, HeatmapElement]:
+    ) -> tuple[HeatmapElement, Tensor, HeatmapElement]:
         all_output = self._heatmap_forward(x)
-        if prev_target is None:
-            prev_target = self._initial_target_like(all_output)
-
-        selector_input = torch.cat(
-            (
-                self._element_to_tensor(prev_target),
-                self._element_to_tensor(all_output),
-            ),
-            dim=1,
+        if prev_target_heatmap is None:
+            prev_target_heatmap = self._initial_target_like(all_output.heatmap)
+        merge_input = torch.cat((prev_target_heatmap, all_output.heatmap), dim=1)
+        merged_heatmap = self.merge_model(merge_input)
+        next_target = self.choose_next_target(
+            merged_heatmap,
+            teacher_target=teacher_target,
+            teacher_forcing=teacher_forcing,
         )
-        target_output = self._tensor_to_element(self.selector(selector_input))
-        teacher_forcing = self.teacher_forcing if teacher_forcing is None else float(teacher_forcing)
-        if not 0.0 <= teacher_forcing <= 1.0:
-            raise ValueError(f"teacher_forcing must be in [0, 1], got {teacher_forcing}.")
-        use_teacher = False
-        if self.training and teacher_target is not None and teacher_forcing > 0.0:
-            semistep_sample = torch.rand((), device=target_output.heatmap.device).item()
-            use_teacher = teacher_forcing >= 1.0 or semistep_sample < teacher_forcing
-        next_target = teacher_target if use_teacher else target_output
-        return target_output, next_target, all_output
+        return HeatmapElement(heatmap=merged_heatmap, offset=all_output.offset), next_target, all_output
 
     def forward(
         self,
         x: Tensor,
-        prev_target: HeatmapElement | None = None,
-        teacher_targets: HeatmapElement | None = None,
+        prev_target_heatmap: Tensor | None = None,
+        teacher_targets: Tensor | None = None,
         teacher_forcing: float | None = None,
+        return_sequence: bool = True,
     ):
         if x.ndim == 4:
-            target_output, next_target, _all_output = self.forward_step(
+            output, next_target, _all_output = self.forward_step(
                 x,
-                prev_target,
+                prev_target_heatmap,
                 teacher_target=teacher_targets,
                 teacher_forcing=teacher_forcing,
             )
-            return target_output if prev_target is None else (target_output, next_target)
+            return output if prev_target_heatmap is None else (output, next_target)
         if x.ndim != 5:
             raise ValueError("x must have shape (B, C, H, W) or (B, T, C, H, W).")
         if teacher_targets is not None and (
-            teacher_targets.heatmap.ndim != 5
-            or teacher_targets.offset.ndim != 5
-            or teacher_targets.heatmap.shape[:2] != x.shape[:2]
-            or teacher_targets.offset.shape[:2] != x.shape[:2]
+            teacher_targets.ndim != 5 or teacher_targets.shape[:2] != x.shape[:2]
         ):
-            raise ValueError(
-                "teacher_targets must have heatmap shape (B, T, 1, H, W) "
-                "and offset shape (B, T, 2, H, W)."
-            )
+            raise ValueError("teacher_targets must have shape (B, T, 1, H, W).")
 
         outputs: list[HeatmapElement] = []
-        next_target = prev_target
+        last_output: HeatmapElement | None = None
+        next_target = prev_target_heatmap
         for frame_idx in range(x.shape[1]):
-            teacher_target = None
-            if teacher_targets is not None:
-                teacher_target = HeatmapElement(
-                    heatmap=teacher_targets.heatmap[:, frame_idx],
-                    offset=teacher_targets.offset[:, frame_idx],
-                )
+            teacher_target = None if teacher_targets is None else teacher_targets[:, frame_idx]
             output, next_target, _all_output = self.forward_step(
                 x[:, frame_idx],
                 next_target,
                 teacher_target=teacher_target,
                 teacher_forcing=teacher_forcing,
             )
-            outputs.append(output)
+            last_output = output
+            if return_sequence:
+                outputs.append(output)
+        if not return_sequence:
+            if last_output is None:
+                raise RuntimeError("No output was produced.")
+            return last_output, next_target
         return HeatmapElement(
             heatmap=torch.stack([output.heatmap for output in outputs], dim=1),
             offset=torch.stack([output.offset for output in outputs], dim=1),
         )
-
-
-NoHiddenLieDA = noHiddenLieDA
 
 
 def make_distance_squared_map(

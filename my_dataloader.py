@@ -49,6 +49,10 @@ class TextureDataset(IterableDataset[dict[str, Tensor]]):
         self.output_size = output_size
         self.seed = seed
 
+    @property
+    def texture_size(self) -> int:
+        return max(self.output_size + 200, 800)
+
     def make_texture(self, rng: np.random.Generator) -> Any:
         raise NotImplementedError
 
@@ -71,7 +75,7 @@ class TextureDataset(IterableDataset[dict[str, Tensor]]):
 class NothingDataset(TextureDataset):
     def make_texture(self, rng: np.random.Generator) -> Any:
         image, _source = make_nothing(
-            output_size=(self.output_size, self.output_size),
+            output_size=(self.texture_size, self.texture_size),
             seed=int(rng.integers(0, np.iinfo(np.int32).max)),
         )
         return image
@@ -81,7 +85,7 @@ class AlchemyDataset(TextureDataset):
     def make_texture(self, rng: np.random.Generator) -> Any:
         maker = rng.choice((make_aluminium_foil, make_ground, make_tiling))
         image, _source = maker(
-            output_size=(self.output_size, self.output_size),
+            output_size=(self.texture_size, self.texture_size),
             seed=int(rng.integers(0, np.iinfo(np.int32).max)),
         )
         return image
@@ -111,7 +115,7 @@ class NormalDataset(TextureDataset):
     def make_texture(self, rng: np.random.Generator) -> Any:
         choice = float(rng.random())
         seed = int(rng.integers(0, np.iinfo(np.int32).max))
-        output_size = (self.output_size, self.output_size)
+        output_size = (self.texture_size, self.texture_size)
 
         if choice < 0.5:
             image_path = self.kth_tips_paths[int(rng.integers(0, len(self.kth_tips_paths)))]

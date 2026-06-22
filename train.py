@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -22,7 +23,7 @@ except ImportError:
     def tqdm(iterable, **_kwargs):
         return iterable
 
-from models import TinyNet, PartialHeatUNet, LieDA, HeatmapElement, apply_distance_bias, decode_centers
+from models import TinyNet, PartialHeatUNet, MergeNet, HeatmapElement, apply_distance_bias, decode_centers
 from my_dataloader import my_dataloader
 
 
@@ -37,6 +38,13 @@ class LossOutput:
 def _sync_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _clone_state_dict_to_cpu(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    return {
+        key: value.detach().cpu().clone() if torch.is_tensor(value) else copy.deepcopy(value)
+        for key, value in state_dict.items()
+    }
 
 
 def _batch_inputs(batch: Any) -> Tensor:
@@ -523,7 +531,7 @@ def load_checkpoint(
 
 
 def load_heatmap_checkpoint(
-    model: LieDA,
+    model: Any,
     params: str | Path,
     *,
     device: torch.device,
@@ -540,14 +548,8 @@ def load_heatmap_checkpoint(
         loaded_step = 0
         checkpoint = {"step": loaded_step}
     model.load_heatmap_state_dict(state_dict, strict=strict)
-    print(f"[train_gru] heatmap params loaded: {checkpoint_path} (step={loaded_step})")
+    print(f"[train_merge] heatmap params loaded: {checkpoint_path} (step={loaded_step})")
     return checkpoint
-
-
-def _detach_hidden(hidden: list[Tensor] | None) -> list[Tensor] | None:
-    if hidden is None:
-        return None
-    return [state.detach() for state in hidden]
 
 
 def _frames_to_uint8_hwc(frames: Tensor) -> np.ndarray:
@@ -582,6 +584,41 @@ def _write_heatmap_image(heatmap: Tensor, path: str | Path, *, output_size: int 
     heatmap_bgr = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
     if not cv2.imwrite(str(path), heatmap_bgr):
         raise RuntimeError(f"Failed to write heatmap image: {path}")
+    return path
+
+
+def _write_loss_plot(loss_history: dict[str, list[float]], path: str | Path) -> Path | None:
+    if not loss_history or not any(loss_history.values()):
+        return None
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    labels = {
+        "total": "total loss",
+        "heatmap": "heatmap loss",
+        "offset": "offset loss",
+        "center": "center loss",
+    }
+
+    plt.figure(figsize=(10, 6))
+    for key in ("total", "heatmap", "offset", "center"):
+        values = loss_history.get(key, [])
+        if values:
+            steps = np.arange(1, len(values) + 1)
+            plt.plot(steps, values, label=labels[key], linewidth=1.8)
+    plt.xlabel("step")
+    plt.ylabel("loss")
+    plt.title("Training Loss")
+    plt.grid(True, alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
     return path
 
 
@@ -711,7 +748,7 @@ def eval(
     heatmap_offset_losses_from_part: list[float] = []
     heatmap_center_losses_from_part: list[float] = []
     last_predicted_heatmap: Tensor | None = None
-    hidden: list[Tensor] | None = None
+    merge_prev_target: Tensor | None = None
 
     for semistep in range(frames_batch.shape[1] - 4):
         inputs = make_semistep_inputs(
@@ -737,8 +774,8 @@ def eval(
         else:
             dummy_centers = None
             semistep_dummy_mask = None
-        if isinstance(model, LieDA):
-            output, hidden, all_output = model.forward_step(inputs, hidden)
+        if isinstance(model, MergeNet):
+            output, merge_prev_target, all_output = model.forward_step(inputs, merge_prev_target)
             heatmap_part_mode = "all" if dummy_centers is not None and semistep_dummy_mask is not None else "target"
             heatmap_part_loss = compute_tracking_loss(
                 all_output,
@@ -895,7 +932,7 @@ def train_heatmap(
     center_loss_weight: float = 0.01,
     softargmax_temperature: float = 0.25,
     wandb_active: bool = False,
-    wandb_project: str = "LieDA",
+    wandb_project: str = "MergeNet",
     use_distance_bias: bool = False,
     gamma: float = 0.0,
     heatmap_mode: str = "target",
@@ -984,9 +1021,21 @@ def train_heatmap(
     }
     last_saved_step = 0
     completed_steps = 0
+    best_step = 0
     best_step_loss = float("inf")
+    best_model_state: dict[str, Tensor] | None = None
+    best_optimizer_state: dict[str, Any] | None = None
+    best_eval_payload: dict[str, Any] | None = None
+    best_step_train_seconds: float | None = None
+    best_train_elapsed_seconds: float | None = None
     steps_without_improvement = 0
-    early_stop_patience = 5
+    early_stop_patience = 20
+    loss_history = {
+        "total": [],
+        "heatmap": [],
+        "offset": [],
+        "center": [],
+    }
     train_start_time = time.perf_counter()
     for step in progress:
         early_stop_triggered = False
@@ -1094,6 +1143,10 @@ def train_heatmap(
             "step_center_loss": float(np.mean(step_center_losses)),
             "step": step + 1,
         }
+        loss_history["total"].append(step_metrics["step_loss"])
+        loss_history["heatmap"].append(step_metrics["step_heatmap_loss"])
+        loss_history["offset"].append(step_metrics["step_offset_loss"])
+        loss_history["center"].append(step_metrics["step_center_loss"])
         _sync_device(device)
         step_train_seconds = float(time.perf_counter() - step_start_time)
         train_elapsed_seconds = float(time.perf_counter() - train_start_time)
@@ -1113,6 +1166,17 @@ def train_heatmap(
         completed_steps = step + 1
         if step_metrics["step_loss"] < best_step_loss:
             best_step_loss = step_metrics["step_loss"]
+            best_step = step + 1
+            best_model_state = _clone_state_dict_to_cpu(model.state_dict())
+            best_optimizer_state = copy.deepcopy(optimizer.state_dict())
+            best_eval_payload = {
+                "frames": frames[0].detach().cpu(),
+                "positions": positions[0].detach().cpu(),
+                "dummy_positions": None if dummy_positions is None else dummy_positions[0].detach().cpu(),
+                "dummy_mask": None if dummy_mask is None else dummy_mask[0].detach().cpu(),
+            }
+            best_step_train_seconds = step_train_seconds
+            best_train_elapsed_seconds = train_elapsed_seconds
             steps_without_improvement = 0
         else:
             steps_without_improvement += 1
@@ -1140,7 +1204,7 @@ def train_heatmap(
             last_saved_step = step + 1
             print(f"[train] checkpoint saved: {checkpoint_path}")
 
-        if eval_step > 0 and (early_stop_triggered or (step + 1) % eval_step == 0):
+        if eval_step > 0 and (step + 1) % eval_step == 0:
             eval_metrics = eval(
                 model,
                 frames[0].detach().cpu(),
@@ -1189,22 +1253,59 @@ def train_heatmap(
 
     if wandb_run is not None:
         wandb_run.finish()
-    if completed_steps > 0 and last_saved_step != completed_steps:
-        checkpoint_path = run_dir / "checkpoints" / f"step_{completed_steps:06d}_final.pt"
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    if best_optimizer_state is not None:
+        optimizer.load_state_dict(best_optimizer_state)
+
+    if completed_steps > 0 and best_step > 0:
+        if eval_step > 0 and best_eval_payload is not None:
+            eval_metrics = eval(
+                model,
+                best_eval_payload["frames"],
+                best_eval_payload["positions"],
+                dummy_positions=best_eval_payload["dummy_positions"],
+                dummy_mask=best_eval_payload["dummy_mask"],
+                output_dir=run_dir / "eval",
+                name=f"step_{best_step:06d}_best",
+                device=device,
+                crop_size=crop_size,
+                heatmap_sigma=heatmap_sigma,
+                offset_loss_weight=offset_loss_weight,
+                center_loss_weight=center_loss_weight,
+                softargmax_temperature=softargmax_temperature,
+                use_distance_bias=use_distance_bias,
+                gamma=gamma,
+                train_elapsed_seconds=best_train_elapsed_seconds,
+                step_train_seconds=best_step_train_seconds,
+                heatmap_mode=heatmap_mode,
+                experiment_name=experiment_name,
+            )
+            print(
+                f"best eval step {best_step}: "
+                f"accuracy={eval_metrics['accuracy']:.4f} "
+                f"loss={eval_metrics['loss']:.6f} "
+                f"distance={eval_metrics['standard_distance']:.3f}"
+            )
+
+        checkpoint_path = run_dir / "checkpoints" / f"step_{best_step:06d}_best_final.pt"
         save_checkpoint(
             model,
             optimizer,
             checkpoint_path,
-            step=completed_steps,
-            config=checkpoint_config,
+            step=best_step,
+            config={**checkpoint_config, "best_step": best_step, "best_step_loss": best_step_loss},
         )
-        print(f"[train] final checkpoint saved: {checkpoint_path}")
+        print(f"[train] best final checkpoint saved: {checkpoint_path}")
+    loss_plot_path = _write_loss_plot(loss_history, run_dir / "loss_plot.png")
+    if loss_plot_path is not None:
+        print(f"[train] loss plot saved: {loss_plot_path}")
     print(f"[train] done: {run_dir}")
     return run_dir
 
 
-def train_gru(
-    model: LieDA,
+def train_merge(
+    model: MergeNet,
     dataloader: DataLoader | None = None,
     *,
     device: torch.device | str | None = None,
@@ -1219,19 +1320,19 @@ def train_gru(
     run_root: str | Path = "runs",
     experiment_name: str | None = None,
     heatmap_sigma: float = 4.0,
-    offset_loss_weight: float = 1.0,
-    center_loss_weight: float = 0.01,
-    softargmax_temperature: float = 0.25,
     sequence_chunk_length: int = 8,
     heatmap_freeze: bool = True,
-    GRU_freeze: bool = False,
+    merge_freeze: bool = False,
+    teacher_forcing: float | None = None,
     wandb_active: bool = False,
-    wandb_project: str = "LieDA",
+    wandb_project: str = "MergeNet",
     use_distance_bias: bool = False,
     gamma: float = 0.0,
 ) -> Path:
     if sequence_chunk_length < 1:
         raise ValueError("sequence_chunk_length must be at least 1.")
+    if teacher_forcing is not None:
+        model.set_teacher_forcing(teacher_forcing)
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
@@ -1242,7 +1343,7 @@ def train_gru(
 
     model.to(device)
     model.set_heatmap_freeze(heatmap_freeze)
-    model.set_GRU_freeze(GRU_freeze)
+    model.set_merge_freeze(merge_freeze)
 
     loaded_heatmap_checkpoint: dict[str, Any] | None = None
     if heatmap_params is not None:
@@ -1255,7 +1356,7 @@ def train_gru(
 
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not trainable_parameters:
-        raise ValueError("No trainable parameters. Set heatmap_freeze=False or GRU_freeze=False.")
+        raise ValueError("No trainable parameters. Set heatmap_freeze=False or merge_freeze=False.")
     optimizer = torch.optim.Adam(trainable_parameters, lr=lr)
 
     loaded_checkpoint: dict[str, Any] | None = None
@@ -1269,17 +1370,15 @@ def train_gru(
         )
 
     heatmap_loss_fn = nn.BCEWithLogitsLoss()
-    offset_loss_fn = nn.SmoothL1Loss(reduction="sum")
     if dataloader is None:
         dataloader = my_dataloader(
             difficulty=1,
             batch=batch,
             pin_memory=False,
-            #pin_memory=device.type == "cuda",
         )
 
     run_dir = make_run_dir(run_root, experiment_name=experiment_name)
-    print(f"[train_gru] run directory: {run_dir}")
+    print(f"[train_merge] run directory: {run_dir}")
     wandb_run = None
     if wandb_active:
         try:
@@ -1291,22 +1390,20 @@ def train_gru(
         wandb_run = wandb.init(
             project=wandb_project,
             config={
-                "train_mode": "gru",
+                "train_mode": "merge",
                 "steps": steps,
                 "batch": batch,
                 "lr": lr,
                 "crop_size": crop_size,
+                "experiment_name": experiment_name,
                 "eval_step": eval_step,
                 "save_step": save_step,
                 "run_dir": str(run_dir),
-                "experiment_name": experiment_name,
                 "heatmap_sigma": heatmap_sigma,
-                "offset_loss_weight": offset_loss_weight,
-                "center_loss_weight": center_loss_weight,
-                "softargmax_temperature": softargmax_temperature,
                 "sequence_chunk_length": sequence_chunk_length,
                 "heatmap_freeze": heatmap_freeze,
-                "GRU_freeze": GRU_freeze,
+                "merge_freeze": merge_freeze,
+                "teacher_forcing": model.teacher_forcing,
                 "use_distance_bias": use_distance_bias,
                 "gamma": gamma,
                 "heatmap_params": None if heatmap_params is None else str(heatmap_params),
@@ -1320,7 +1417,7 @@ def train_gru(
             },
         )
     checkpoint_config = {
-        "train_mode": "gru",
+        "train_mode": "merge",
         "batch": batch,
         "lr": lr,
         "crop_size": crop_size,
@@ -1328,12 +1425,10 @@ def train_gru(
         "eval_step": eval_step,
         "save_step": save_step,
         "heatmap_sigma": heatmap_sigma,
-        "offset_loss_weight": offset_loss_weight,
-        "center_loss_weight": center_loss_weight,
-        "softargmax_temperature": softargmax_temperature,
         "sequence_chunk_length": sequence_chunk_length,
         "heatmap_freeze": heatmap_freeze,
-        "GRU_freeze": GRU_freeze,
+        "merge_freeze": merge_freeze,
+        "teacher_forcing": model.teacher_forcing,
         "use_distance_bias": use_distance_bias,
         "gamma": gamma,
         "heatmap_params": None if heatmap_params is None else str(heatmap_params),
@@ -1345,12 +1440,24 @@ def train_gru(
     }
 
     data_iter = iter(dataloader)
-    progress = tqdm(range(steps), desc="train_gru", unit="step")
+    progress = tqdm(range(steps), desc="train_merge", unit="step")
     last_saved_step = 0
     completed_steps = 0
+    best_step = 0
     best_step_loss = float("inf")
+    best_model_state: dict[str, Tensor] | None = None
+    best_optimizer_state: dict[str, Any] | None = None
+    best_eval_payload: dict[str, Any] | None = None
+    best_step_train_seconds: float | None = None
+    best_train_elapsed_seconds: float | None = None
     steps_without_improvement = 0
-    early_stop_patience = 5
+    early_stop_patience = 20
+    loss_history = {
+        "total": [],
+        "heatmap": [],
+        "offset": [],
+        "center": [],
+    }
     train_start_time = time.perf_counter()
     for step in progress:
         early_stop_triggered = False
@@ -1377,11 +1484,8 @@ def train_gru(
         model.train()
         if heatmap_freeze:
             model.heatmap_model.eval()
-        hidden: list[Tensor] | None = None
+        prev_target_heatmap: Tensor | None = None
         step_losses: list[float] = []
-        step_heatmap_losses: list[float] = []
-        step_offset_losses: list[float] = []
-        step_center_losses: list[float] = []
         semistep_count = frames.shape[1] - 4
 
         for chunk_start in range(0, semistep_count, sequence_chunk_length):
@@ -1389,9 +1493,7 @@ def train_gru(
             optimizer.zero_grad(set_to_none=True)
             chunk_loss = frames.new_zeros(())
             chunk_size = 0
-            chunk_heatmap_losses: list[float] = []
-            chunk_offset_losses: list[float] = []
-            chunk_center_losses: list[float] = []
+            chunk_losses: list[float] = []
 
             for semistep in range(chunk_start, chunk_end):
                 inputs = make_semistep_inputs(
@@ -1405,53 +1507,38 @@ def train_gru(
                     semistep,
                     crop_size=crop_size,
                 )
-                output, hidden, _all_output = model.forward_step(inputs, hidden)
-                loss_output = compute_tracking_loss(
-                    output,
+                output, _next_target, _all_output = model.forward_step(inputs, prev_target_heatmap)
+                target_heatmap, _target_offset, _offset_mask = make_heatmap_and_offset_targets(
                     target_centers,
-                    crop_size=crop_size,
-                    heatmap_loss_fn=heatmap_loss_fn,
-                    offset_loss_fn=offset_loss_fn,
-                    heatmap_sigma=heatmap_sigma,
-                    offset_loss_weight=offset_loss_weight,
-                    center_loss_weight=center_loss_weight,
-                    softargmax_temperature=softargmax_temperature,
-                    heatmap_mode="target",
+                    input_size=crop_size,
+                    output_height=output.heatmap.shape[-2],
+                    output_width=output.heatmap.shape[-1],
+                    sigma=heatmap_sigma,
                 )
-                chunk_loss = chunk_loss + loss_output.loss
+                loss = heatmap_loss_fn(output.heatmap, target_heatmap)
+                prev_target_heatmap = model.choose_next_target(
+                    output.heatmap,
+                    teacher_target=target_heatmap,
+                )
+                chunk_loss = chunk_loss + loss
                 chunk_size += 1
-                chunk_heatmap_losses.append(float(loss_output.heatmap_loss.detach().cpu()))
-                chunk_offset_losses.append(float(loss_output.offset_loss.detach().cpu()))
-                chunk_center_losses.append(float(loss_output.center_loss.detach().cpu()))
+                loss_value = float(loss.detach().cpu())
+                chunk_losses.append(loss_value)
 
             chunk_loss = chunk_loss / max(chunk_size, 1)
             chunk_loss.backward()
             optimizer.step()
-            hidden = _detach_hidden(hidden)
+            if prev_target_heatmap is not None:
+                prev_target_heatmap = prev_target_heatmap.detach()
 
-            loss_value = float(chunk_loss.detach().cpu())
-            heatmap_loss_value = float(np.mean(chunk_heatmap_losses))
-            offset_loss_value = float(np.mean(chunk_offset_losses))
-            center_loss_value = float(np.mean(chunk_center_losses))
+            loss_value = float(np.mean(chunk_losses))
             step_losses.append(loss_value)
-            step_heatmap_losses.append(heatmap_loss_value)
-            step_offset_losses.append(offset_loss_value)
-            step_center_losses.append(center_loss_value)
             if hasattr(progress, "set_postfix"):
-                progress.set_postfix(
-                    loss=loss_value,
-                    heatmap=heatmap_loss_value,
-                    offset=offset_loss_value,
-                    center=center_loss_value,
-                    chunk=f"{chunk_start}:{chunk_end}",
-                )
+                progress.set_postfix(loss=loss_value, chunk=f"{chunk_start}:{chunk_end}")
             if wandb_run is not None:
                 wandb_run.log(
                     {
                         "loss": loss_value,
-                        "heatmap_loss": heatmap_loss_value,
-                        "offset_loss": offset_loss_value,
-                        "center_loss": center_loss_value,
                         "step": step,
                         "chunk_start": chunk_start,
                         "chunk_end": chunk_end,
@@ -1464,15 +1551,13 @@ def train_gru(
         step_train_seconds = float(time.perf_counter() - step_start_time)
         train_elapsed_seconds = float(time.perf_counter() - train_start_time)
         step_loss = float(np.mean(step_losses))
-        step_heatmap_loss = float(np.mean(step_heatmap_losses))
-        step_offset_loss = float(np.mean(step_offset_losses))
-        step_center_loss = float(np.mean(step_center_losses))
+        loss_history["total"].append(step_loss)
+        loss_history["heatmap"].append(step_loss)
+        loss_history["offset"].append(0.0)
+        loss_history["center"].append(0.0)
         print(
-            f"gru step {step + 1}/{steps} "
+            f"merge step {step + 1}/{steps} "
             f"loss={step_loss:.6f} "
-            f"heatmap={step_heatmap_loss:.6f} "
-            f"offset={step_offset_loss:.6f} "
-            f"center={step_center_loss:.6f} "
             f"time={step_train_seconds:.2f}s "
             f"elapsed={train_elapsed_seconds:.2f}s"
         )
@@ -1480,9 +1565,6 @@ def train_gru(
             wandb_run.log(
                 {
                     "step_loss": step_loss,
-                    "step_heatmap_loss": step_heatmap_loss,
-                    "step_offset_loss": step_offset_loss,
-                    "step_center_loss": step_center_loss,
                     "step": step + 1,
                     "step_train_seconds": step_train_seconds,
                     "train_elapsed_seconds": train_elapsed_seconds,
@@ -1492,17 +1574,28 @@ def train_gru(
 
         if step_loss < best_step_loss:
             best_step_loss = step_loss
+            best_step = step + 1
+            best_model_state = _clone_state_dict_to_cpu(model.state_dict())
+            best_optimizer_state = copy.deepcopy(optimizer.state_dict())
+            best_eval_payload = {
+                "frames": frames[0].detach().cpu(),
+                "positions": positions[0].detach().cpu(),
+                "dummy_positions": None if dummy_positions is None else dummy_positions[0].detach().cpu(),
+                "dummy_mask": None if dummy_mask is None else dummy_mask[0].detach().cpu(),
+            }
+            best_step_train_seconds = step_train_seconds
+            best_train_elapsed_seconds = train_elapsed_seconds
             steps_without_improvement = 0
         else:
             steps_without_improvement += 1
             print(
-                f"[train_gru] no loss improvement for "
+                f"[train_merge] no loss improvement for "
                 f"{steps_without_improvement}/{early_stop_patience} steps "
                 f"(best={best_step_loss:.6f})"
             )
             if steps_without_improvement >= early_stop_patience:
                 print(
-                    f"[train_gru] early stop: loss did not improve for "
+                    f"[train_merge] early stop: loss did not improve for "
                     f"{early_stop_patience} steps."
                 )
                 early_stop_triggered = True
@@ -1517,9 +1610,9 @@ def train_gru(
                 config=checkpoint_config,
             )
             last_saved_step = step + 1
-            print(f"[train_gru] checkpoint saved: {checkpoint_path}")
+            print(f"[train_merge] checkpoint saved: {checkpoint_path}")
 
-        if eval_step > 0 and (early_stop_triggered or (step + 1) % eval_step == 0):
+        if eval_step > 0 and (step + 1) % eval_step == 0:
             eval_metrics = eval(
                 model,
                 frames[0].detach().cpu(),
@@ -1531,9 +1624,8 @@ def train_gru(
                 device=device,
                 crop_size=crop_size,
                 heatmap_sigma=heatmap_sigma,
-                offset_loss_weight=offset_loss_weight,
-                center_loss_weight=center_loss_weight,
-                softargmax_temperature=softargmax_temperature,
+                offset_loss_weight=1.0,
+                center_loss_weight=0.0,
                 use_distance_bias=use_distance_bias,
                 gamma=gamma,
                 train_elapsed_seconds=train_elapsed_seconds,
@@ -1542,7 +1634,7 @@ def train_gru(
                 experiment_name=experiment_name,
             )
             print(
-                f"gru eval step {step + 1}: "
+                f"merge eval step {step + 1}: "
                 f"accuracy={eval_metrics['accuracy']:.4f} "
                 f"loss={eval_metrics['loss']:.6f} "
                 f"distance={eval_metrics['standard_distance']:.3f}"
@@ -1554,23 +1646,10 @@ def train_gru(
                         "eval/loss": eval_metrics["loss"],
                         "eval/heatmap_loss": eval_metrics["heatmap_loss"],
                         "eval/offset_loss": eval_metrics["offset_loss"],
-                        "eval/center_loss": eval_metrics["center_loss"],
                         "eval/standard_distance": eval_metrics["standard_distance"],
                         "eval/eval_time_seconds": eval_metrics["eval_time_seconds"],
                         "eval/train_elapsed_seconds": eval_metrics["train_elapsed_seconds"],
                         "eval/step_train_seconds": eval_metrics["step_train_seconds"],
-                        **(
-                            {
-                                "eval/heatmap_eval_loss": eval_metrics["heatmap_eval_loss"],
-                                "eval/heatmap_heatmap_loss": eval_metrics["heatmap_heatmap_loss"],
-                                "eval/heatmap_offset_loss": eval_metrics["heatmap_offset_loss"],
-                                "eval/heatmap_center_loss": eval_metrics["heatmap_center_loss"],
-                                "eval/heatmap_accuracy": eval_metrics["heatmap_accuracy"],
-                                "eval/heatmap_standard_distance": eval_metrics["heatmap_standard_distance"],
-                            }
-                            if "heatmap_eval_loss" in eval_metrics
-                            else {}
-                        ),
                     },
                     step=(step + 1) * semistep_count,
                 )
@@ -1580,17 +1659,53 @@ def train_gru(
 
     if wandb_run is not None:
         wandb_run.finish()
-    if completed_steps > 0 and last_saved_step != completed_steps:
-        checkpoint_path = run_dir / "checkpoints" / f"step_{completed_steps:06d}_final.pt"
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    if best_optimizer_state is not None:
+        optimizer.load_state_dict(best_optimizer_state)
+
+    if completed_steps > 0 and best_step > 0:
+        if eval_step > 0 and best_eval_payload is not None:
+            eval_metrics = eval(
+                model,
+                best_eval_payload["frames"],
+                best_eval_payload["positions"],
+                dummy_positions=best_eval_payload["dummy_positions"],
+                dummy_mask=best_eval_payload["dummy_mask"],
+                output_dir=run_dir / "eval",
+                name=f"step_{best_step:06d}_best",
+                device=device,
+                crop_size=crop_size,
+                heatmap_sigma=heatmap_sigma,
+                offset_loss_weight=1.0,
+                center_loss_weight=0.0,
+                use_distance_bias=use_distance_bias,
+                gamma=gamma,
+                train_elapsed_seconds=best_train_elapsed_seconds,
+                step_train_seconds=best_step_train_seconds,
+                heatmap_mode="target",
+                experiment_name=experiment_name,
+            )
+            print(
+                f"best merge eval step {best_step}: "
+                f"accuracy={eval_metrics['accuracy']:.4f} "
+                f"loss={eval_metrics['loss']:.6f} "
+                f"distance={eval_metrics['standard_distance']:.3f}"
+            )
+
+        checkpoint_path = run_dir / "checkpoints" / f"step_{best_step:06d}_best_final.pt"
         save_checkpoint(
             model,
             optimizer,
             checkpoint_path,
-            step=completed_steps,
-            config=checkpoint_config,
+            step=best_step,
+            config={**checkpoint_config, "best_step": best_step, "best_step_loss": best_step_loss},
         )
-        print(f"[train_gru] final checkpoint saved: {checkpoint_path}")
-    print(f"[train_gru] done: {run_dir}")
+        print(f"[train_merge] best final checkpoint saved: {checkpoint_path}")
+    loss_plot_path = _write_loss_plot(loss_history, run_dir / "loss_plot.png")
+    if loss_plot_path is not None:
+        print(f"[train_merge] loss plot saved: {loss_plot_path}")
+    print(f"[train_merge] done: {run_dir}")
     return run_dir
 
 
@@ -1603,11 +1718,11 @@ def train(
 ) -> Path:
     if model_type == "heatmap":
         return train_heatmap(model, dataloader, **kwargs)
-    if model_type == "gru":
-        if not isinstance(model, LieDA):
-            raise TypeError("model_type='gru' requires a LieDA model.")
-        return train_gru(model, dataloader, **kwargs)
-    raise ValueError(f"model_type must be 'heatmap' or 'gru', got {model_type!r}.")
+    if model_type == "merge":
+        if not isinstance(model, MergeNet):
+            raise TypeError("model_type='merge' requires a MergeNet model.")
+        return train_merge(model, dataloader, **kwargs)
+    raise ValueError(f"model_type must be 'heatmap' or 'merge', got {model_type!r}.")
 
 
 if __name__ == "__main__":
@@ -1623,86 +1738,56 @@ if __name__ == "__main__":
     experiment_name = input("Write experiment name or skip: ").strip() or None
     common["experiment_name"] = experiment_name
 
-    # 1. difficulty 1: train PartialUNet heatmap model only.
-    #train(
-    #   PartialHeatUNet(in_channels=7),
-    #   my_dataloader(difficulty=1, batch=common["batch"]),
-    #   model_type="heatmap",
-    #   heatmap_mode="all",
-    #   **common,
-    #)
-
-    # 2. difficulty 1: load latest heatmap into LieDA, freeze heatmap, train GRU only.
-    #train(
-    #      LieDA(
-    #          PartialHeatUNet(in_channels=7),
-    #          heatmap_freeze=True,
-    #          GRU_freeze=False,
-    #      ),
-    #      my_dataloader(difficulty=1, batch=common["batch"]),
-    #      model_type="gru",
-    #      heatmap_params="latest",
-    #      heatmap_freeze=True,
-    #      GRU_freeze=False,
-    #      **common,
-    #  )
-
-    # 3. difficulty 2: train heatmap side only.
-    #train(
-    #    LieDA(
-    #         PartialHeatUNet(in_channels=7),
-    #         heatmap_freeze=False,
-    #         GRU_freeze=True,
-    #    ),
-    #    my_dataloader(difficulty=2, batch=common["batch"]),
-    #    model_type="gru",
-    #    params="latest",
-    #    heatmap_freeze=False,
-    #    GRU_freeze=True,
-    #    **common,
-    # )
-
-    # 4. difficulty 2: freeze heatmap, train GRU only.
+    # 1. 처음 학습
     train(
-         LieDA(
-             PartialHeatUNet(in_channels=7),
-             heatmap_freeze=True,
-             GRU_freeze=False,
-         ),
-         my_dataloader(difficulty=2, batch=common["batch"]),
-         model_type="gru",
-         params="latest",
-         heatmap_freeze=True,
-         GRU_freeze=False,
-         **common,
-     )
+        PartialHeatUNet(in_channels=7),
+        my_dataloader(difficulty=1, batch=common["batch"]),
+        model_type="heatmap",
+        heatmap_mode="all",
+        **common,
+    )
 
-    # 5. difficulty 3: train heatmap side only.
+    # 2. 난이도 1 MergeNet 학습 (이거 정확도가 90은 나와야 될거같음)
     # train(
-    #     LieDA(
+    #     MergeNet(
     #         PartialHeatUNet(in_channels=7),
-    #         heatmap_freeze=False,
-    #         GRU_freeze=True,
+    #         heatmap_freeze=True,
+    #         merge_freeze=False,
     #     ),
-    #     my_dataloader(difficulty=3, batch=common["batch"]),
-    #     model_type="gru",
+    #     my_dataloader(difficulty=1, batch=common["batch"]),
+    #     model_type="merge",
     #     params="latest",
-    #     heatmap_freeze=False,
-    #     GRU_freeze=True,
+    #     heatmap_freeze=True,
+    #     merge_freeze=False,
     #     **common,
     # )
 
-    # 6. difficulty 3: freeze heatmap, train GRU only.
+    # 3. 난이도 2 MergeNet 앞부분 학습
     # train(
-    #     LieDA(
+    #     MergeNet(
     #         PartialHeatUNet(in_channels=7),
     #         heatmap_freeze=True,
-    #         GRU_freeze=False,
+    #         merge_freeze=False,
     #     ),
-    #     my_dataloader(difficulty=3, batch=common["batch"]),
-    #     model_type="gru",
+    #     my_dataloader(difficulty=2, batch=common["batch"]),
+    #     model_type="merge",
+    #     params="latest",
+    #     heatmap_freeze=False,
+    #     merge_freeze=True,
+    #     **common,
+    # )
+
+    # 4. 난이도 2 MergeNet 뒷부분 학습
+    # train(
+    #     MergeNet(
+    #         PartialHeatUNet(in_channels=7),
+    #         heatmap_freeze=True,
+    #         merge_freeze=False,
+    #     ),
+    #     my_dataloader(difficulty=2, batch=common["batch"]),
+    #     model_type="merge",
     #     params="latest",
     #     heatmap_freeze=True,
-    #     GRU_freeze=False,
+    #     merge_freeze=False,
     #     **common,
     # )

@@ -307,7 +307,20 @@ def make_ground(
         canvas[y0:y1, x0:x1] = local_canvas * (1.0 - alpha) + grain * alpha
 
         contact = mask.astype(np.float32)
-        contact = np.roll(contact, shift=(int(length * 0.10), int(-length * 0.06)), axis=(0, 1))
+        shift_y = int(length * 0.10)
+        shift_x = int(-length * 0.06)
+        shifted_contact = np.zeros_like(contact)
+        src_y0 = max(0, -shift_y)
+        src_y1 = contact.shape[0] - max(0, shift_y)
+        dst_y0 = max(0, shift_y)
+        dst_y1 = dst_y0 + max(0, src_y1 - src_y0)
+        src_x0 = max(0, -shift_x)
+        src_x1 = contact.shape[1] - max(0, shift_x)
+        dst_x0 = max(0, shift_x)
+        dst_x1 = dst_x0 + max(0, src_x1 - src_x0)
+        if src_y1 > src_y0 and src_x1 > src_x0:
+            shifted_contact[dst_y0:dst_y1, dst_x0:dst_x1] = contact[src_y0:src_y1, src_x0:src_x1]
+        contact = shifted_contact
         shadow[y0:y1, x0:x1] += contact * rng.uniform(16.0, 36.0)
 
     canvas -= shadow[..., None] * np.array([0.82, 0.72, 0.55], dtype=np.float32)
