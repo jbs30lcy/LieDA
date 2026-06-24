@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
@@ -44,6 +44,30 @@ def _clone_state_dict_to_cpu(state_dict: dict[str, Tensor]) -> dict[str, Tensor]
     return {
         key: value.detach().cpu().clone() if torch.is_tensor(value) else copy.deepcopy(value)
         for key, value in state_dict.items()
+    }
+
+
+def _make_train_result(
+    model: Any,
+    *,
+    metrics: dict[str, Any] | None,
+    completed_steps: int,
+    best_step: int,
+    best_step_loss: float,
+) -> dict[str, Any]:
+    fallback_metrics = {
+        "completed_steps": completed_steps,
+        "best_step": best_step,
+        "best_step_loss": best_step_loss,
+    }
+    if metrics is None:
+        metrics = fallback_metrics
+    else:
+        metrics = {**metrics, **fallback_metrics}
+
+    return {
+        "metrics": metrics,
+        "cpu_state_dict": _clone_state_dict_to_cpu(model.state_dict()),
     }
 
 
@@ -936,7 +960,7 @@ def train_heatmap(
     use_distance_bias: bool = False,
     gamma: float = 0.0,
     heatmap_mode: str = "target",
-) -> Path:
+) -> dict[str, Any]:
     if heatmap_mode not in {"target", "all"}:
         raise ValueError(f"heatmap_mode must be 'target' or 'all', got {heatmap_mode!r}.")
     if device is None:
@@ -1036,6 +1060,8 @@ def train_heatmap(
         "offset": [],
         "center": [],
     }
+    final_metrics: dict[str, Any] | None = None
+    loss_plot_path: Path | None = None
     train_start_time = time.perf_counter()
     for step in progress:
         early_stop_triggered = False
@@ -1287,6 +1313,7 @@ def train_heatmap(
                 f"loss={eval_metrics['loss']:.6f} "
                 f"distance={eval_metrics['standard_distance']:.3f}"
             )
+            final_metrics = eval_metrics
 
         checkpoint_path = run_dir / "checkpoints" / f"step_{best_step:06d}_best_final.pt"
         save_checkpoint(
@@ -1301,7 +1328,13 @@ def train_heatmap(
     if loss_plot_path is not None:
         print(f"[train] loss plot saved: {loss_plot_path}")
     print(f"[train] done: {run_dir}")
-    return run_dir
+    return _make_train_result(
+        model,
+        metrics=final_metrics,
+        completed_steps=completed_steps,
+        best_step=best_step,
+        best_step_loss=best_step_loss,
+    )
 
 
 def train_merge(
@@ -1328,7 +1361,7 @@ def train_merge(
     wandb_project: str = "MergeNet",
     use_distance_bias: bool = False,
     gamma: float = 0.0,
-) -> Path:
+) -> dict[str, Any]:
     if sequence_chunk_length < 1:
         raise ValueError("sequence_chunk_length must be at least 1.")
     if teacher_forcing is not None:
@@ -1458,6 +1491,8 @@ def train_merge(
         "offset": [],
         "center": [],
     }
+    final_metrics: dict[str, Any] | None = None
+    loss_plot_path: Path | None = None
     train_start_time = time.perf_counter()
     for step in progress:
         early_stop_triggered = False
@@ -1692,6 +1727,7 @@ def train_merge(
                 f"loss={eval_metrics['loss']:.6f} "
                 f"distance={eval_metrics['standard_distance']:.3f}"
             )
+            final_metrics = eval_metrics
 
         checkpoint_path = run_dir / "checkpoints" / f"step_{best_step:06d}_best_final.pt"
         save_checkpoint(
@@ -1706,7 +1742,13 @@ def train_merge(
     if loss_plot_path is not None:
         print(f"[train_merge] loss plot saved: {loss_plot_path}")
     print(f"[train_merge] done: {run_dir}")
-    return run_dir
+    return _make_train_result(
+        model,
+        metrics=final_metrics,
+        completed_steps=completed_steps,
+        best_step=best_step,
+        best_step_loss=best_step_loss,
+    )
 
 
 def train(
@@ -1715,7 +1757,7 @@ def train(
     *,
     model_type: str = "heatmap",
     **kwargs: Any,
-) -> Path:
+) -> dict[str, Any]:
     if model_type == "heatmap":
         return train_heatmap(model, dataloader, **kwargs)
     if model_type == "merge":
@@ -1738,8 +1780,8 @@ if __name__ == "__main__":
     experiment_name = input("Write experiment name or skip: ").strip() or None
     common["experiment_name"] = experiment_name
 
-    # 1. 처음 학습
-    train(
+    # 1. Train heatmap on difficulty 1.
+    stage1 = train(
         PartialHeatUNet(in_channels=7),
         my_dataloader(difficulty=1, batch=common["batch"]),
         model_type="heatmap",
@@ -1747,47 +1789,31 @@ if __name__ == "__main__":
         **common,
     )
 
-    # 2. 난이도 1 MergeNet 학습 (이거 정확도가 90은 나와야 될거같음)
-    # train(
-    #     MergeNet(
-    #         PartialHeatUNet(in_channels=7),
-    #         heatmap_freeze=True,
-    #         merge_freeze=False,
-    #     ),
-    #     my_dataloader(difficulty=1, batch=common["batch"]),
-    #     model_type="merge",
-    #     params="latest",
-    #     heatmap_freeze=True,
-    #     merge_freeze=False,
-    #     **common,
-    # )
+    # 3. Continue heatmap on difficulty 2.
+    stage3_model = PartialHeatUNet(in_channels=7)
+    stage3_model.load_state_dict(stage1["cpu_state_dict"])
+    stage3 = train(
+        stage3_model,
+        my_dataloader(difficulty=2, batch=common["batch"]),
+        model_type="heatmap",
+        heatmap_mode="all",
+        **common,
+    )
 
-    # 3. 난이도 2 MergeNet 앞부분 학습
-    # train(
-    #     MergeNet(
-    #         PartialHeatUNet(in_channels=7),
-    #         heatmap_freeze=True,
-    #         merge_freeze=False,
-    #     ),
-    #     my_dataloader(difficulty=2, batch=common["batch"]),
-    #     model_type="merge",
-    #     params="latest",
-    #     heatmap_freeze=False,
-    #     merge_freeze=True,
-    #     **common,
-    # )
+    # 2. Train merge on difficulty 1 with the stage 3 heatmap.
+    stage2_model = MergeNet(
+        PartialHeatUNet(in_channels=7),
+        heatmap_freeze=True,
+        merge_freeze=False,
+    )
+    stage2_model.load_heatmap_state_dict(stage3["cpu_state_dict"])
+    train(
+        stage2_model,
+        my_dataloader(difficulty=1, batch=common["batch"]),
+        model_type="merge",
+        heatmap_freeze=True,
+        merge_freeze=False,
+        **common,
+    )
 
-    # 4. 난이도 2 MergeNet 뒷부분 학습
-    # train(
-    #     MergeNet(
-    #         PartialHeatUNet(in_channels=7),
-    #         heatmap_freeze=True,
-    #         merge_freeze=False,
-    #     ),
-    #     my_dataloader(difficulty=2, batch=common["batch"]),
-    #     model_type="merge",
-    #     params="latest",
-    #     heatmap_freeze=True,
-    #     merge_freeze=False,
-    #     **common,
-    # )
+
