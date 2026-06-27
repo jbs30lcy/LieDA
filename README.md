@@ -1,1 +1,1 @@
-PartialHeatUNet 말고 ShortNet이랑 TinyNet도 있음. 이거 한번씩 다 해줘 망해도
+그냥 실행만 해보고 바로 넘겨주셈

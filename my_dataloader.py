@@ -12,9 +12,13 @@ from alchemy import make_aluminium_foil, make_ground, make_nothing, make_tiling
 from make_train import make_base_image, make_target
 
 
-def _image_to_tensor(image: Any) -> Tensor:
-    image_array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
-    return torch.from_numpy(image_array).permute(2, 0, 1).contiguous()
+def _frames_to_tensor(frames: list[Any]) -> Tensor:
+    frame_array = np.stack(
+        [np.asarray(frame.convert("RGB"), dtype=np.float32) for frame in frames],
+        axis=0,
+    )
+    frame_array *= 1.0 / 255.0
+    return torch.from_numpy(frame_array).permute(0, 3, 1, 2).contiguous()
 
 
 def _make_sample(texture: Any, *, n_frames: int, output_size: int) -> dict[str, Tensor]:
@@ -24,10 +28,10 @@ def _make_sample(texture: Any, *, n_frames: int, output_size: int) -> dict[str, 
         out_w=output_size,
         out_h=output_size,
     )
-    frame_tensor = torch.stack([_image_to_tensor(frame) for frame in frames])
-    position_tensor = torch.from_numpy(positions).to(torch.float32)
-    dummy_position_tensor = torch.from_numpy(dummy_positions).to(torch.float32)
-    dummy_mask_tensor = torch.from_numpy(dummy_mask).to(torch.bool)
+    frame_tensor = _frames_to_tensor(frames)
+    position_tensor = torch.from_numpy(positions)
+    dummy_position_tensor = torch.from_numpy(dummy_positions)
+    dummy_mask_tensor = torch.from_numpy(dummy_mask)
     return {
         "frames": frame_tensor,
         "positions": position_tensor,
@@ -117,14 +121,14 @@ class NormalDataset(TextureDataset):
         seed = int(rng.integers(0, np.iinfo(np.int32).max))
         output_size = (self.texture_size, self.texture_size)
 
-        if choice < 0.5:
+        if choice < 0.3:
             image_path = self.kth_tips_paths[int(rng.integers(0, len(self.kth_tips_paths)))]
             image, _source = make_base_image(
                 data_dir=self.kth_tips_dir,
                 path=image_path,
                 output_size=output_size,
             )
-        elif choice < 0.8:
+        elif choice < 0.7:
             image, _source = make_ground(output_size=output_size, seed=seed)
         elif choice < 0.9:
             image, _source = make_aluminium_foil(output_size=output_size, seed=seed)

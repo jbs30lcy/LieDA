@@ -177,6 +177,7 @@ def make_semistep_inputs(
     semistep: int,
     *,
     crop_size: int = 576,
+    previous_input: Tensor | None = None,
 ) -> Tensor:
     if frames.ndim != 5:
         raise ValueError("frames must have shape (B, T, C, H, W).")
@@ -188,14 +189,31 @@ def make_semistep_inputs(
         raise ValueError("semistep must be in [0, T - 5].")
 
     target_frame_idx = semistep + 4
-    rgb = frames[:, target_frame_idx]
+    if previous_input is not None:
+        if previous_input.ndim != 4 or previous_input.shape[1] != 7:
+            raise ValueError("previous_input must have shape (B, 7, H, W).")
+        rgb = crop_center(frames[:, target_frame_idx], crop_size=crop_size)
+        grayscale = 0.299 * rgb[:, 0] + 0.587 * rgb[:, 1] + 0.114 * rgb[:, 2]
+        previous_grayscale = (
+            0.299 * previous_input[:, 0]
+            + 0.587 * previous_input[:, 1]
+            + 0.114 * previous_input[:, 2]
+        )
+        latest_difference = grayscale - previous_grayscale
+        return torch.cat(
+            [rgb, latest_difference.unsqueeze(1), previous_input[:, 3:6]],
+            dim=1,
+        )
+
+    window = frames[:, target_frame_idx - 4 : target_frame_idx + 1]
+    rgb = window[:, -1]
     grayscale = (
-        0.299 * frames[:, :, 0]
-        + 0.587 * frames[:, :, 1]
-        + 0.114 * frames[:, :, 2]
+        0.299 * window[:, :, 0]
+        + 0.587 * window[:, :, 1]
+        + 0.114 * window[:, :, 2]
     )
     differences = [
-        grayscale[:, target_frame_idx - k] - grayscale[:, target_frame_idx - k - 1]
+        grayscale[:, -1 - k] - grayscale[:, -2 - k]
         for k in range(4)
     ]
     stacked = torch.cat([rgb, *(diff.unsqueeze(1) for diff in differences)], dim=1)
@@ -773,6 +791,7 @@ def eval(
     heatmap_center_losses_from_part: list[float] = []
     last_predicted_heatmap: Tensor | None = None
     merge_prev_target: Tensor | None = None
+    previous_inputs: Tensor | None = None
 
     for semistep in range(frames_batch.shape[1] - 4):
         inputs = make_semistep_inputs(
@@ -780,7 +799,9 @@ def eval(
             positions_batch,
             semistep,
             crop_size=crop_size,
+            previous_input=previous_inputs,
         )
+        previous_inputs = inputs
         target_centers = make_semistep_targets(
             positions_batch,
             semistep,
@@ -1091,13 +1112,16 @@ def train_heatmap(
         step_offset_losses: list[float] = []
         step_center_losses: list[float] = []
         semistep_count = frames.shape[1] - 4
+        previous_inputs: Tensor | None = None
         for semistep in range(semistep_count):
             inputs = make_semistep_inputs(
                 frames,
                 positions,
                 semistep,
                 crop_size=crop_size,
+                previous_input=previous_inputs,
             )
+            previous_inputs = inputs
             target_centers = make_semistep_targets(
                 positions,
                 semistep,
@@ -1522,6 +1546,7 @@ def train_merge(
         prev_target_heatmap: Tensor | None = None
         step_losses: list[float] = []
         semistep_count = frames.shape[1] - 4
+        previous_inputs: Tensor | None = None
 
         for chunk_start in range(0, semistep_count, sequence_chunk_length):
             chunk_end = min(chunk_start + sequence_chunk_length, semistep_count)
@@ -1536,7 +1561,9 @@ def train_merge(
                     positions,
                     semistep,
                     crop_size=crop_size,
+                    previous_input=previous_inputs,
                 )
+                previous_inputs = inputs
                 target_centers = make_semistep_targets(
                     positions,
                     semistep,
@@ -1780,25 +1807,6 @@ if __name__ == "__main__":
     experiment_name = input("Write experiment name or skip: ").strip() or None
     common["experiment_name"] = experiment_name
 
-    # 1. Train heatmap on difficulty 1.
-    stage1 = train(
-        PartialHeatUNet(in_channels=7),
-        my_dataloader(difficulty=1, batch=common["batch"]),
-        model_type="heatmap",
-        heatmap_mode="all",
-        **common,
-    )
-
-    # 3. Continue heatmap on difficulty 2.
-    stage3_model = PartialHeatUNet(in_channels=7)
-    stage3_model.load_state_dict(stage1["cpu_state_dict"])
-    stage3 = train(
-        stage3_model,
-        my_dataloader(difficulty=2, batch=common["batch"]),
-        model_type="heatmap",
-        heatmap_mode="all",
-        **common,
-    )
 
     # 2. Train merge on difficulty 1 with the stage 3 heatmap.
     stage2_model = MergeNet(
@@ -1806,12 +1814,26 @@ if __name__ == "__main__":
         heatmap_freeze=True,
         merge_freeze=False,
     )
-    stage2_model.load_heatmap_state_dict(stage3["cpu_state_dict"])
     train(
         stage2_model,
-        my_dataloader(difficulty=1, batch=common["batch"]),
+        my_dataloader(difficulty=2, batch=common["batch"]),
         model_type="merge",
         heatmap_freeze=True,
+        merge_freeze=False,
+        **common,
+    )
+
+    # 3 test
+    stage4_model = MergeNet(
+        PartialHeatUNet(in_channels=7),
+        heatmap_freeze=True,
+        merge_freeze=False,
+    )
+    train(
+        stage4_model,
+        my_dataloader(difficulty=3, batch=common["batch"]),
+        model_type="merge",
+        heatmap_freeze=False,
         merge_freeze=False,
         **common,
     )
